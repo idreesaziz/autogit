@@ -20,23 +20,27 @@ console = Console()
 def show_menu() -> None:
     """Render the main menu and handle user choices in a loop."""
     while True:
-        console.print()
-        console.print(Panel(
-            "[bold]\\[1][/bold]  Create a new repo\n"
-            "[bold]\\[2][/bold]  Work on existing repo\n"
-            "[bold]\\[3][/bold]  Run all repos (auto)\n"
-            "[bold]\\[4][/bold]  View session logs\n"
-            "[bold]\\[Q][/bold]  Quit",
-            title="[bold cyan]autogit[/bold cyan]",
-            subtitle="Autonomous GitHub Agent",
-            border_style="cyan",
-        ))
+        try:
+            console.print()
+            console.print(Panel(
+                "[bold]\\[1][/bold]  Create a new repo\n"
+                "[bold]\\[2][/bold]  Work on existing repo\n"
+                "[bold]\\[3][/bold]  Run all repos (auto)\n"
+                "[bold]\\[4][/bold]  View session logs\n"
+                "[bold]\\[Q][/bold]  Quit",
+                title="[bold cyan]autogit[/bold cyan]",
+                subtitle="Autonomous GitHub Agent",
+                border_style="cyan",
+            ))
 
-        choice = Prompt.ask(
-            "Choose an option",
-            choices=["1", "2", "3", "4", "q", "Q"],
-            default="q",
-        )
+            choice = Prompt.ask(
+                "Choose an option",
+                choices=["1", "2", "3", "4", "q", "Q"],
+                default="q",
+            )
+        except (KeyboardInterrupt, EOFError):
+            console.print("\n[dim]Goodbye![/dim]")
+            break
 
         if choice in ("q", "Q"):
             console.print("[dim]Goodbye![/dim]")

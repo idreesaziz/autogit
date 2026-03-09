@@ -1,98 +1,119 @@
 """autogit — Autonomous GitHub Agent.
 
-Entry point: UI router and deadline watchdog.
-Run with: python main.py
+Commands:
+    python main.py              Interactive menu (opens in a new window if called from service)
+    python main.py service      Start the background service (runs 24/7, no window)
+    python main.py stop         Stop the background service
+    python main.py status       Check if the service is running
 """
 
 from __future__ import annotations
 
-import random
-import threading
-from datetime import date, datetime
-
-import schedule
-import time as _time
-from zoneinfo import ZoneInfo
+import os
+import subprocess
+import sys
+from pathlib import Path
 
 from rich.console import Console
 from rich.panel import Panel
 
-from config import DAILY_DEADLINE_HOUR, TIMEZONE, WEEKDAY_BASE, MOMENTUM_BOOST, MOMENTUM_DECAY
+from config import DAILY_DEADLINE_HOUR, TIMEZONE
 from github_ops.api import list_managed_repos
-from ui.menu import show_menu, run_all_repos
+from service import PID_FILE, LOG_FILE, is_running
 
 console = Console()
+_APP_DIR = Path(__file__).resolve().parent
 
 
-def _now() -> datetime:
-    """Current time in the configured timezone."""
-    return datetime.now(ZoneInfo(TIMEZONE))
+def _start_service() -> None:
+    """Launch the background service using pythonw (no console window)."""
+    pid = is_running()
+    if pid:
+        console.print(f"[yellow]Service already running (PID {pid}).[/yellow]")
+        return
+
+    service_script = str(_APP_DIR / "service.py")
+
+    # Try pythonw.exe first (windowless), fall back to python in background
+    pythonw = Path(sys.executable).parent / "pythonw.exe"
+    if pythonw.exists():
+        proc = subprocess.Popen(
+            [str(pythonw), service_script],
+            cwd=str(_APP_DIR),
+            creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NO_WINDOW,
+        )
+    else:
+        proc = subprocess.Popen(
+            [sys.executable, service_script],
+            cwd=str(_APP_DIR),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NO_WINDOW,
+        )
+
+    console.print(f"[green]Service started (PID {proc.pid}).[/green]")
+    console.print(f"[dim]Log file: {LOG_FILE}[/dim]")
+    console.print(f"[dim]Deadline: {DAILY_DEADLINE_HOUR}:00 {TIMEZONE}[/dim]")
 
 
-def _all_repos_ran_today() -> bool:
-    """Check if every managed repo already had a session today."""
+def _stop_service() -> None:
+    """Stop the background service."""
+    pid = is_running()
+    if not pid:
+        console.print("[yellow]Service is not running.[/yellow]")
+        return
+
+    try:
+        os.kill(pid, 15)  # SIGTERM
+        console.print(f"[green]Service stopped (PID {pid}).[/green]")
+    except OSError as exc:
+        console.print(f"[red]Could not stop service: {exc}[/red]")
+
+    # Clean up PID file
+    try:
+        PID_FILE.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _show_status() -> None:
+    """Show service and repo status."""
+    pid = is_running()
+    if pid:
+        status_line = f"[green]Running[/green] (PID {pid})"
+    else:
+        status_line = "[red]Stopped[/red]"
+
     repos = list_managed_repos()
-    if not repos:
-        return False
-    today = date.today().isoformat()
-    return all(r.get("last_session") == today for r in repos)
+    repo_lines = ""
+    if repos:
+        for r in repos:
+            repo_lines += f"\n  • {r['name']} — last session: {r.get('last_session', 'never')}"
+    else:
+        repo_lines = "\n  (no managed repos)"
+
+    console.print(Panel(
+        f"[bold]Service:[/bold]  {status_line}\n"
+        f"[bold]Deadline:[/bold] {DAILY_DEADLINE_HOUR}:00 {TIMEZONE}\n"
+        f"[bold]Log:[/bold]      {LOG_FILE}\n"
+        f"[bold]Repos:[/bold]{repo_lines}",
+        title="[bold cyan]autogit status[/bold cyan]",
+        border_style="cyan",
+    ))
 
 
-def _any_repo_ran_yesterday() -> bool:
-    """Check if at least one repo committed yesterday (momentum check)."""
-    repos = list_managed_repos()
-    yesterday = date.today().toordinal() - 1
-    for r in repos:
-        last = r.get("last_session", "")
-        try:
-            if date.fromisoformat(last).toordinal() == yesterday:
-                return True
-        except ValueError:
-            continue
-    return False
-
-
-def _should_commit_today() -> bool:
-    """Use weekday-based probability + momentum to decide if today is a commit day."""
-    weekday = _now().weekday()
-    base = WEEKDAY_BASE.get(weekday, 0.5)
-    momentum = MOMENTUM_BOOST if _any_repo_ran_yesterday() else MOMENTUM_DECAY
-    probability = max(0.0, min(1.0, base + momentum))
-    roll = random.random()
-    console.print(
-        f"[dim]Commit probability today ({_now().strftime('%A')}): "
-        f"{probability:.0%} — roll: {roll:.2f}[/dim]"
+def _open_cli() -> None:
+    """Open the interactive CLI menu in a new console window."""
+    cli_script = str(_APP_DIR / "cli.py")
+    subprocess.Popen(
+        ["cmd", "/c", "start", "autogit", sys.executable, cli_script],
+        cwd=str(_APP_DIR),
     )
-    return roll < probability
-
-
-def _deadline_auto_run() -> None:
-    """Called at the deadline hour if no session ran today — runs all repos."""
-    if _all_repos_ran_today():
-        return
-    if not _should_commit_today():
-        console.print("[dim]Skipping today based on commit cadence.[/dim]")
-        return
-    console.print("[bold yellow]Deadline reached — running autonomous sessions…[/bold yellow]")
-    run_all_repos(silent=True)
-
-
-def _start_watchdog() -> None:
-    """Schedule a deadline check and run it in a background thread."""
-    schedule.every().day.at(f"{DAILY_DEADLINE_HOUR:02d}:00").do(_deadline_auto_run)
-
-    def _loop() -> None:
-        while True:
-            schedule.run_pending()
-            _time.sleep(30)
-
-    thread = threading.Thread(target=_loop, daemon=True)
-    thread.start()
+    console.print("[dim]CLI opened in a new window.[/dim]")
 
 
 def main() -> None:
-    """Application entry point."""
-    # ── Header ───────────────────────────────────────────────────────
+    """Application entry point — route to the right command."""
     console.print(Panel(
         "[bold]Autonomous GitHub Agent[/bold]\n"
         "[dim]Maintains your repos with daily incremental improvements[/dim]",
@@ -101,36 +122,25 @@ def main() -> None:
         padding=(1, 2),
     ))
 
-    # ── Check if all repos already ran today ─────────────────────────
-    repos = list_managed_repos()
-    if repos and _all_repos_ran_today():
-        console.print(Panel(
-            "[green]All managed repos have already been updated today.[/green]\n"
-            f"[dim]Repos: {', '.join(r['name'] for r in repos)}[/dim]",
-            title="Status",
-            border_style="green",
-        ))
-        return
+    args = sys.argv[1:]
+    command = args[0].lower() if args else ""
 
-    # ── Deadline watchdog ────────────────────────────────────────────
-    now = _now()
-    if repos and now.hour >= DAILY_DEADLINE_HOUR and not _all_repos_ran_today():
-        console.print(
-            f"[bold yellow]Past deadline ({DAILY_DEADLINE_HOUR}:00) — "
-            "checking commit cadence…[/bold yellow]"
-        )
-        if _should_commit_today():
-            run_all_repos(silent=False)
-            return
+    if command == "service":
+        _start_service()
+    elif command == "stop":
+        _stop_service()
+    elif command == "status":
+        _show_status()
+    elif command == "cli":
+        _open_cli()
+    else:
+        # Default: start service if not running, then open CLI in new window
+        pid = is_running()
+        if not pid:
+            _start_service()
         else:
-            console.print("[dim]Skipping today based on natural commit cadence.[/dim]")
-            return
-
-    # ── Start background watchdog ────────────────────────────────────
-    _start_watchdog()
-
-    # ── Interactive menu ─────────────────────────────────────────────
-    show_menu()
+            console.print(f"[dim]Service already running (PID {pid}).[/dim]")
+        _open_cli()
 
 
 if __name__ == "__main__":
