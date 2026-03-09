@@ -21,6 +21,7 @@ from ui.repo_selector import select_repo
 console = Console()
 
 ROLLS_FILE = LOCAL_REPOS_DIR / "autogit_rolls.json"
+SCHEDULE_FILE = LOCAL_REPOS_DIR / "autogit_schedule.json"
 
 
 def show_menu() -> None:
@@ -33,8 +34,8 @@ def show_menu() -> None:
                 "[bold]\\[2][/bold]  Work on existing repo\n"
                 "[bold]\\[3][/bold]  Run all repos (auto)\n"
                 "[bold]\\[4][/bold]  View session logs\n"
-                "[bold]\\[5][/bold]  View dice rolls\n"
-                "[bold]\\[6][/bold]  Run dice sequence now\n"
+                "[bold]\\[5][/bold]  View dice rolls & schedule\n"
+                "[bold]\\[6][/bold]  Roll & schedule now\n"
                 "[bold]\\[Q][/bold]  Quit",
                 title="[bold cyan]autogit[/bold cyan]",
                 subtitle="Autonomous GitHub Agent",
@@ -243,7 +244,47 @@ def _handle_view_logs() -> None:
 # ── Option 5: View dice rolls ───────────────────────────────────────
 
 def _handle_view_rolls() -> None:
-    """Display roll history from the service's roll log."""
+    """Display roll history and today's schedule."""
+    # ── Today's schedule ─────────────────────────────────────────────
+    if SCHEDULE_FILE.exists():
+        try:
+            schedule = json.loads(SCHEDULE_FILE.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            schedule = {}
+
+        if schedule and schedule.get("sessions"):
+            sched_table = Table(
+                title=f"Today's Schedule  ({schedule.get('date', '?')}  |  prob={schedule.get('probability', 0):.0%}  |  {schedule.get('session_count', 0)} session(s) from {schedule.get('total_rolls', 0)} roll(s))",
+                show_lines=True,
+            )
+            sched_table.add_column("#", style="bold", width=4, justify="right")
+            sched_table.add_column("Scheduled Time", width=20)
+            sched_table.add_column("Status", width=10)
+
+            for s in schedule["sessions"]:
+                ts = s.get("scheduled_time", "?")
+                if "T" in ts:
+                    ts = ts.replace("T", " ")[:19]
+                status = s.get("status", "?")
+                status_map = {
+                    "pending": "[yellow]pending[/yellow]",
+                    "running": "[cyan]running[/cyan]",
+                    "done": "[green]done[/green]",
+                    "error": "[red]error[/red]",
+                }
+                sched_table.add_row(
+                    str(s.get("session_num", "?")),
+                    ts,
+                    status_map.get(status, status),
+                )
+            console.print(sched_table)
+        elif schedule:
+            console.print(
+                f"[dim]Today ({schedule.get('date', '?')}): "
+                f"0 sessions scheduled (all rolls failed).[/dim]"
+            )
+
+    # ── Roll history ─────────────────────────────────────────────────
     if not ROLLS_FILE.exists():
         console.print("[yellow]No roll history yet. Start the service to begin rolling.[/yellow]")
         return
@@ -303,13 +344,19 @@ def _handle_view_rolls() -> None:
 # ── Option 6: Run dice sequence now (debug) ─────────────────────────
 
 def _handle_run_dice() -> None:
-    """Manually trigger the rolling sequence as if deadline hour arrived."""
-    from service import _run_rolling_sequence, _get_today_probability
+    """Manually plan the day (roll dice + schedule times), then run due sessions."""
+    from service import _plan_day, _run_pending_sessions, _get_today_probability
 
     prob = _get_today_probability()
     console.print(
-        f"\n[bold cyan]Starting dice roll sequence[/bold cyan]  "
-        f"(today's probability: [bold]{prob:.0%}[/bold])\n"
+        f"\n[bold cyan]Planning today's sessions[/bold cyan]  "
+        f"(probability: [bold]{prob:.0%}[/bold])\n"
     )
 
-    _run_rolling_sequence(live=True)
+    schedule = _plan_day(live=True)
+
+    if schedule.get("session_count", 0) > 0:
+        console.print("\n[bold cyan]Running all scheduled sessions now…[/bold cyan]")
+        _run_pending_sessions(live=True, run_now=True)
+    else:
+        console.print("\n[dim]No sessions to run (all rolls failed).[/dim]")

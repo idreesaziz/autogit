@@ -64,5 +64,13 @@ WEEKDAY_BASE: dict[int, float] = {
 MOMENTUM_BOOST: float = 0.10   # bonus if committed yesterday
 MOMENTUM_DECAY: float = -0.05  # penalty if skipped yesterday
 
+# ── Gaussian time distribution ───────────────────────────────────────
+# Sessions are scheduled with a Gaussian centered GAUSS_MEAN_OFFSET hours
+# after the deadline hour, with GAUSS_STDDEV hours of spread.
+# ~68% of sessions fall within ±1σ of the mean.
+GAUSS_MEAN_OFFSET: float = 6.5   # hours after deadline (e.g. 11+6.5 = 17:30)
+GAUSS_STDDEV: float = 1.5        # hours (1σ covers ~4 PM – 7 PM)
+GAUSS_WINDOW: float = 23.667     # max hours after deadline (23h40m = next day minus 20min)
+
 # ── Ensure repos directory exists ────────────────────────────────────
 LOCAL_REPOS_DIR.mkdir(parents=True, exist_ok=True)
