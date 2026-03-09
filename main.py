@@ -105,8 +105,11 @@ def _show_status() -> None:
 def _open_cli() -> None:
     """Open the interactive CLI menu in a new console window."""
     cli_script = str(_APP_DIR / "cli.py")
+    # start requires the title in quotes, and quoted exe path for spaces
+    cmd_str = f'start "autogit" "{sys.executable}" "{cli_script}"'
     subprocess.Popen(
-        ["cmd", "/c", "start", "autogit", sys.executable, cli_script],
+        cmd_str,
+        shell=True,
         cwd=str(_APP_DIR),
     )
     console.print("[dim]CLI opened in a new window.[/dim]")
