@@ -42,9 +42,10 @@ from config import (
     GAUSS_MEAN_OFFSET,
     GAUSS_STDDEV,
     GAUSS_WINDOW,
+    RECENCY_BOOST,
 )
 from github_ops.api import list_managed_repos
-from ui.menu import run_all_repos
+from agent.session import run_session, BudgetExhaustedError, GeminiCallError
 
 # ── Paths ────────────────────────────────────────────────────────────
 PID_FILE = LOCAL_REPOS_DIR / "autogit_service.pid"
@@ -143,6 +144,32 @@ def _roll_dice(probability: float, session_num: int) -> bool:
     return passed
 
 
+# ── Repo selection (weighted by recency) ────────────────────────────
+
+def _pick_repo() -> dict | None:
+    """Choose ONE repo for today, weighted so yesterday's repo is more likely."""
+    repos = list_managed_repos()
+    if not repos:
+        return None
+    if len(repos) == 1:
+        return repos[0]
+
+    yesterday = (date.today().toordinal() - 1)
+    weights: list[float] = []
+    for r in repos:
+        w = 1.0
+        try:
+            last = r.get("last_session", "")
+            if last and date.fromisoformat(last).toordinal() == yesterday:
+                w = RECENCY_BOOST
+        except ValueError:
+            pass
+        weights.append(w)
+
+    chosen = random.choices(repos, weights=weights, k=1)[0]
+    return chosen
+
+
 # ── Schedule persistence ─────────────────────────────────────────────
 
 def _load_schedule() -> dict:
@@ -197,6 +224,18 @@ def _plan_day(live: bool = False) -> dict:
     session_count = 0
     roll_num = 0
 
+    # Pick ONE repo for the day
+    chosen_repo = _pick_repo()
+    if not chosen_repo:
+        log.warning("No managed repos found — nothing to schedule.")
+        if live:
+            con.print("  [yellow]No managed repos found.[/yellow]")
+        return {"date": now.date().isoformat(), "session_count": 0, "sessions": []}
+
+    log.info("Repo selected for today: %s", chosen_repo["name"])
+    if live:
+        con.print(f"  Repo for today: [bold cyan]{chosen_repo['name']}[/bold cyan]\n")
+
     # Roll the geometric dice
     while True:
         roll_num += 1
@@ -237,6 +276,8 @@ def _plan_day(live: bool = False) -> dict:
         "probability": round(probability, 2),
         "total_rolls": roll_num,
         "session_count": session_count,
+        "repo": chosen_repo["name"],
+        "repo_path": chosen_repo["local_path"],
         "sessions": sessions,
     }
     _save_schedule(schedule)
@@ -295,21 +336,29 @@ def _run_pending_sessions(live: bool = False, run_now: bool = False) -> None:
             if now < scheduled_time:
                 continue
 
-        # Time has arrived — run the session
+        # Time has arrived — run the session on the chosen repo
         session_num = session["session_num"]
-        log.info("Session %d: scheduled time reached (%s). Running.", session_num, session["scheduled_time"])
+        repo_name = schedule.get("repo", "?")
+        repo_path = schedule.get("repo_path", "")
+        log.info("Session %d on %s: scheduled time reached (%s). Running.",
+                 session_num, repo_name, session["scheduled_time"])
 
         if live:
             ts = session["scheduled_time"].replace("T", " ")[:19]
-            con.print(f"\n  [bold cyan]Running session {session_num}[/bold cyan] (scheduled {ts})")
+            con.print(f"\n  [bold cyan]Running session {session_num} on {repo_name}[/bold cyan] (scheduled {ts})")
 
         session["status"] = "running"
         _save_schedule(schedule)
 
         try:
-            run_all_repos(silent=not live, force=True)
+            run_session(repo_path, mode="auto", force=True)
             session["status"] = "done"
             log.info("Session %d completed successfully.", session_num)
+        except (FileNotFoundError, BudgetExhaustedError, GeminiCallError) as exc:
+            session["status"] = "error"
+            log.error("Session %d error: %s", session_num, exc)
+            if live:
+                con.print(f"  [red]Session error: {exc}[/red]")
         except Exception as exc:
             session["status"] = "error"
             log.error("Session %d error: %s", session_num, exc)

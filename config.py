@@ -72,5 +72,8 @@ GAUSS_MEAN_OFFSET: float = 6.5   # hours after deadline (e.g. 11+6.5 = 17:30)
 GAUSS_STDDEV: float = 1.5        # hours (1σ covers ~4 PM – 7 PM)
 GAUSS_WINDOW: float = 23.667     # max hours after deadline (23h40m = next day minus 20min)
 
+# ── Repo selection ───────────────────────────────────────────────────
+RECENCY_BOOST: float = 2.0  # weight multiplier for a repo that was picked yesterday
+
 # ── Ensure repos directory exists ────────────────────────────────────
 LOCAL_REPOS_DIR.mkdir(parents=True, exist_ok=True)

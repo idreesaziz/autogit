@@ -253,8 +253,15 @@ def _handle_view_rolls() -> None:
             schedule = {}
 
         if schedule and schedule.get("sessions"):
+            repo_name = schedule.get("repo", "?")
             sched_table = Table(
-                title=f"Today's Schedule  ({schedule.get('date', '?')}  |  prob={schedule.get('probability', 0):.0%}  |  {schedule.get('session_count', 0)} session(s) from {schedule.get('total_rolls', 0)} roll(s))",
+                title=(
+                    f"Today's Schedule  ({schedule.get('date', '?')}  |  "
+                    f"repo={repo_name}  |  "
+                    f"prob={schedule.get('probability', 0):.0%}  |  "
+                    f"{schedule.get('session_count', 0)} session(s) from "
+                    f"{schedule.get('total_rolls', 0)} roll(s))"
+                ),
                 show_lines=True,
             )
             sched_table.add_column("#", style="bold", width=4, justify="right")
