@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Prompt, IntPrompt
@@ -12,9 +15,12 @@ from agent.session import run_session, _make_gemini_call, BudgetExhaustedError, 
 from agent.researcher import research_trending_ideas, create_repo_from_idea
 from github_ops.api import list_managed_repos
 from agent.memory import load_state
+from config import LOCAL_REPOS_DIR
 from ui.repo_selector import select_repo
 
 console = Console()
+
+ROLLS_FILE = LOCAL_REPOS_DIR / "autogit_rolls.json"
 
 
 def show_menu() -> None:
@@ -27,6 +33,8 @@ def show_menu() -> None:
                 "[bold]\\[2][/bold]  Work on existing repo\n"
                 "[bold]\\[3][/bold]  Run all repos (auto)\n"
                 "[bold]\\[4][/bold]  View session logs\n"
+                "[bold]\\[5][/bold]  View dice rolls\n"
+                "[bold]\\[6][/bold]  Run dice sequence now\n"
                 "[bold]\\[Q][/bold]  Quit",
                 title="[bold cyan]autogit[/bold cyan]",
                 subtitle="Autonomous GitHub Agent",
@@ -35,7 +43,7 @@ def show_menu() -> None:
 
             choice = Prompt.ask(
                 "Choose an option",
-                choices=["1", "2", "3", "4", "q", "Q"],
+                choices=["1", "2", "3", "4", "5", "6", "q", "Q"],
                 default="q",
             )
         except (KeyboardInterrupt, EOFError):
@@ -53,6 +61,10 @@ def show_menu() -> None:
             _handle_run_all()
         elif choice == "4":
             _handle_view_logs()
+        elif choice == "5":
+            _handle_view_rolls()
+        elif choice == "6":
+            _handle_run_dice()
 
 
 # ── Option 1: Create a new repo ─────────────────────────────────────
@@ -226,3 +238,80 @@ def _handle_view_logs() -> None:
             )
 
         console.print(table)
+
+
+# ── Option 5: View dice rolls ───────────────────────────────────────
+
+def _handle_view_rolls() -> None:
+    """Display roll history from the service's roll log."""
+    if not ROLLS_FILE.exists():
+        console.print("[yellow]No roll history yet. Start the service to begin rolling.[/yellow]")
+        return
+
+    try:
+        rolls = json.loads(ROLLS_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        console.print("[red]Could not read roll history.[/red]")
+        return
+
+    if not rolls:
+        console.print("[yellow]No rolls recorded yet.[/yellow]")
+        return
+
+    # Show last 20 rolls
+    recent = rolls[-20:]
+
+    table = Table(title=f"Dice Roll History  ({len(rolls)} total rolls)", show_lines=True)
+    table.add_column("#", style="bold", width=5, justify="right")
+    table.add_column("Timestamp", style="dim", width=20)
+    table.add_column("Day", width=10)
+    table.add_column("Sess", justify="right", width=5)
+    table.add_column("Prob", justify="right", width=6)
+    table.add_column("Roll", justify="right", width=7)
+    table.add_column("Result", width=8)
+
+    start_idx = len(rolls) - len(recent) + 1
+    for i, entry in enumerate(recent, start_idx):
+        result = entry.get("result", "?")
+        result_style = "[green]COMMIT[/green]" if result == "COMMIT" else "[red]STOP[/red]"
+        ts = entry.get("timestamp", "?")
+        if "T" in ts:
+            ts = ts.replace("T", " ")[:19]
+        table.add_row(
+            str(i),
+            ts,
+            entry.get("weekday", "?"),
+            str(entry.get("session_num", "")),
+            f"{entry.get('probability', 0):.0%}",
+            f"{entry.get('roll', 0):.4f}",
+            result_style,
+        )
+
+    console.print(table)
+
+    # Stats summary
+    commits = sum(1 for r in rolls if r.get("result") == "COMMIT")
+    stops = len(rolls) - commits
+    console.print(
+        f"\n  [bold]Total:[/bold] {len(rolls)} rolls  |  "
+        f"[green]{commits} COMMIT[/green]  |  "
+        f"[red]{stops} STOP[/red]  |  "
+        f"Win rate: [bold]{commits / len(rolls):.0%}[/bold]"
+    )
+
+
+# ── Option 6: Run dice sequence now (debug) ─────────────────────────
+
+def _handle_run_dice() -> None:
+    """Manually trigger the rolling sequence as if deadline hour arrived."""
+    from service import _run_rolling_sequence, _get_today_probability
+
+    prob = _get_today_probability()
+    console.print(
+        f"\n[bold cyan]Starting dice roll sequence[/bold cyan]  "
+        f"(today's probability: [bold]{prob:.0%}[/bold])\n"
+    )
+
+    _run_rolling_sequence()
+
+    console.print("\n[dim]Dice sequence finished.[/dim]")

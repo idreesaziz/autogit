@@ -1,11 +1,16 @@
 """autogit background service — runs 24/7 as a persistent process.
 
-Checks the deadline every 30 seconds. When the deadline hour arrives
-and no session has run today, it rolls the commit-cadence dice and
-(if the roll passes) runs autonomous sessions on all managed repos.
+At the deadline hour each day, rolls the commit-dice in a loop:
+  roll → pass? → do work → roll again → pass? → do work → …
+  …until a roll fails, then stop for the day.
+
+With probability p the bot does at least 1 session, p² for 2, p³ for 3,
+etc.  (geometric distribution — expected sessions ≈ p / (1 − p)).
+
+Every roll is logged to autogit_rolls.json for CLI visibility.
 
 Designed to be launched via `pythonw.exe` so it runs without a console
-window. Communicates status through a PID file and a log file.
+window. Communicates status through a PID file and log files.
 
 Usage (managed by main.py):
     pythonw.exe service.py          # start silently (no window)
@@ -14,6 +19,7 @@ Usage (managed by main.py):
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import random
@@ -38,6 +44,10 @@ from ui.menu import run_all_repos
 # ── Paths ────────────────────────────────────────────────────────────
 PID_FILE = LOCAL_REPOS_DIR / "autogit_service.pid"
 LOG_FILE = LOCAL_REPOS_DIR / "autogit_service.log"
+ROLLS_FILE = LOCAL_REPOS_DIR / "autogit_rolls.json"
+
+# ── Delay between consecutive rolls in a session (seconds) ──────────
+INTER_ROLL_DELAY = 5  # small pause between successive rolls in one sequence
 
 # ── Logging ──────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -74,40 +84,91 @@ def _any_repo_ran_yesterday() -> bool:
     return False
 
 
-def _should_commit_today() -> bool:
+def _load_rolls() -> list[dict]:
+    """Load the roll history from disk."""
+    if not ROLLS_FILE.exists():
+        return []
+    try:
+        return json.loads(ROLLS_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return []
+
+
+def _save_roll(entry: dict) -> None:
+    """Append a single roll entry to the rolls log file."""
+    rolls = _load_rolls()
+    rolls.append(entry)
+    ROLLS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    ROLLS_FILE.write_text(json.dumps(rolls, indent=2), encoding="utf-8")
+
+
+def _get_today_probability() -> float:
+    """Compute today's commit probability (base + momentum)."""
     weekday = _now().weekday()
     base = WEEKDAY_BASE.get(weekday, 0.5)
     momentum = MOMENTUM_BOOST if _any_repo_ran_yesterday() else MOMENTUM_DECAY
-    probability = max(0.0, min(1.0, base + momentum))
-    roll = random.random()
-    log.info(
-        "Commit check: %s, base=%.2f, momentum=%.2f, prob=%.0f%%, roll=%.2f → %s",
-        _now().strftime("%A"), base, momentum, probability * 100, roll,
-        "COMMIT" if roll < probability else "SKIP",
-    )
-    return roll < probability
+    return max(0.0, min(1.0, base + momentum))
 
 
-def _check_deadline() -> None:
-    """Core check — called every loop iteration."""
+def _roll_dice(probability: float, session_num: int) -> bool:
+    """Do a single dice roll, log it, and return whether it passed."""
     now = _now()
+    weekday = now.weekday()
+    base = WEEKDAY_BASE.get(weekday, 0.5)
+    momentum = probability - base  # recover the momentum that was applied
+    roll = random.random()
+    passed = roll < probability
 
-    if now.hour < DAILY_DEADLINE_HOUR:
-        return  # not time yet
+    entry = {
+        "timestamp": now.isoformat(),
+        "weekday": now.strftime("%A"),
+        "session_num": session_num,
+        "base": round(base, 2),
+        "momentum": round(momentum, 2),
+        "probability": round(probability, 2),
+        "roll": round(roll, 4),
+        "result": "COMMIT" if passed else "STOP",
+    }
+    _save_roll(entry)
 
-    if _all_repos_ran_today():
-        return  # already done
+    total = len(_load_rolls())
+    log.info(
+        "Roll #%d (session %d): %s, prob=%.0f%%, roll=%.4f → %s",
+        total, session_num, now.strftime("%A"),
+        probability * 100, roll, entry["result"],
+    )
+    return passed
 
-    if not _should_commit_today():
-        log.info("Skipping today based on commit cadence.")
-        return
 
-    log.info("Deadline reached — running autonomous sessions on all repos.")
-    try:
-        run_all_repos(silent=True)
-        log.info("Autonomous sessions completed successfully.")
-    except Exception as exc:
-        log.error("Session error: %s", exc)
+def _run_rolling_sequence() -> None:
+    """Roll → work → roll → work → … until a roll fails.
+
+    Each passing roll triggers an autonomous session on all repos.
+    The sequence stops on the first failing roll (geometric distribution).
+    """
+    probability = _get_today_probability()
+    session_num = 0
+
+    while True:
+        session_num += 1
+        passed = _roll_dice(probability, session_num)
+
+        if not passed:
+            log.info(
+                "Stopping after %d roll(s) today (last roll failed).",
+                session_num,
+            )
+            return
+
+        log.info("Roll %d passed — running autonomous sessions.", session_num)
+        try:
+            run_all_repos(silent=True)
+            log.info("Session %d completed successfully.", session_num)
+        except Exception as exc:
+            log.error("Session %d error: %s", session_num, exc)
+
+        # Small pause before the next roll
+        time.sleep(INTER_ROLL_DELAY)
 
 
 def _write_pid() -> None:
@@ -162,18 +223,18 @@ def run_service() -> None:
     log.info("Service started (PID %d). Deadline hour: %d:00 %s",
              os.getpid(), DAILY_DEADLINE_HOUR, TIMEZONE)
 
-    last_check_date: str = ""
+    last_roll_date: str = ""
 
     try:
         while True:
-            today = date.today().isoformat()
+            now = _now()
+            today = now.date().isoformat()
 
-            # Only run the deadline check once per day
-            if today != last_check_date:
-                now = _now()
-                if now.hour >= DAILY_DEADLINE_HOUR:
-                    _check_deadline()
-                    last_check_date = today
+            # Once per day, after the deadline hour, run the full rolling sequence
+            if now.hour >= DAILY_DEADLINE_HOUR and today != last_roll_date:
+                last_roll_date = today
+                log.info("Deadline hour reached — starting dice roll sequence.")
+                _run_rolling_sequence()
 
             time.sleep(30)
     except KeyboardInterrupt:
