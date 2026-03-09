@@ -103,12 +103,14 @@ class GeminiCallError(Exception):
 def run_session(
     repo_local_path: str | Path,
     mode: str = "auto",
+    force: bool = False,
 ) -> dict[str, Any]:
     """Run a single improvement session on a repo.
 
     Args:
         repo_local_path: Absolute path to the local clone.
         mode: "auto" or "manual" (both run the same loop currently).
+        force: If True, skip the "already ran today" check.
 
     Returns:
         Session summary dict with task, files_changed, commit_message, requests_used.
@@ -128,16 +130,17 @@ def run_session(
         console.print("[yellow]No .agent_state.json found — cannot run session.[/yellow]")
         raise
 
-    # Idempotency: skip if already ran today
-    last_log = state.get("session_log", [])
-    if last_log and last_log[-1].get("date") == date.today().isoformat():
-        console.print("[yellow]Session already ran today — skipping.[/yellow]")
-        return {
-            "task": "(skipped — already ran today)",
-            "files_changed": [],
-            "commit_message": "",
-            "requests_used": 0,
-        }
+    # Idempotency: skip if already ran today (unless forced)
+    if not force:
+        last_log = state.get("session_log", [])
+        if last_log and last_log[-1].get("date") == date.today().isoformat():
+            console.print("[yellow]Session already ran today — skipping.[/yellow]")
+            return {
+                "task": "(skipped — already ran today)",
+                "files_changed": [],
+                "commit_message": "",
+                "requests_used": 0,
+            }
 
     recent_files = get_recent_files(repo_local_path)
     file_tree = get_file_tree(repo_local_path)

@@ -140,12 +140,18 @@ def _roll_dice(probability: float, session_num: int) -> bool:
     return passed
 
 
-def _run_rolling_sequence() -> None:
+def _run_rolling_sequence(live: bool = False) -> None:
     """Roll → work → roll → work → … until a roll fails.
 
     Each passing roll triggers an autonomous session on all repos.
     The sequence stops on the first failing roll (geometric distribution).
+
+    Args:
+        live: If True, print roll results to console (for interactive use).
     """
+    from rich.console import Console
+    con = Console() if live else None
+
     probability = _get_today_probability()
     session_num = 0
 
@@ -153,19 +159,41 @@ def _run_rolling_sequence() -> None:
         session_num += 1
         passed = _roll_dice(probability, session_num)
 
+        # Read back the last saved entry for display
+        if live:
+            rolls = _load_rolls()
+            entry = rolls[-1] if rolls else {}
+            roll_val = entry.get("roll", 0)
+            result = entry.get("result", "?")
+            style = "green" if result == "COMMIT" else "red"
+            con.print(
+                f"  Roll {session_num}: "
+                f"prob=[bold]{probability:.0%}[/bold]  "
+                f"roll=[bold]{roll_val:.4f}[/bold]  "
+                f"→ [{style}]{result}[/{style}]"
+            )
+
         if not passed:
             log.info(
                 "Stopping after %d roll(s) today (last roll failed).",
                 session_num,
             )
+            if live:
+                commits = session_num - 1
+                con.print(
+                    f"\n  [dim]Sequence done: {commits} session(s) triggered, "
+                    f"stopped on roll {session_num}.[/dim]"
+                )
             return
 
         log.info("Roll %d passed — running autonomous sessions.", session_num)
         try:
-            run_all_repos(silent=True)
+            run_all_repos(silent=not live, force=True)
             log.info("Session %d completed successfully.", session_num)
         except Exception as exc:
             log.error("Session %d error: %s", session_num, exc)
+            if live:
+                con.print(f"  [red]Session error: {exc}[/red]")
 
         # Small pause before the next roll
         time.sleep(INTER_ROLL_DELAY)

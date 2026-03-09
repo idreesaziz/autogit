@@ -154,7 +154,7 @@ def _handle_work_on_repo() -> None:
 
 # ── Option 3: Run all repos automatically ───────────────────────────
 
-def run_all_repos(silent: bool = False) -> None:
+def run_all_repos(silent: bool = False, force: bool = False) -> None:
     """Run a session on every managed repo. Used by menu and deadline watchdog."""
     repos = list_managed_repos()
     if not repos:
@@ -167,7 +167,7 @@ def run_all_repos(silent: bool = False) -> None:
         if not silent:
             console.print(f"\n[bold cyan]── {repo['name']} ──[/bold cyan]")
         try:
-            summary = run_session(repo["local_path"], mode="auto")
+            summary = run_session(repo["local_path"], mode="auto", force=force)
             results.append({"repo": repo["name"], **summary})
         except FileNotFoundError:
             if not silent:
@@ -312,6 +312,4 @@ def _handle_run_dice() -> None:
         f"(today's probability: [bold]{prob:.0%}[/bold])\n"
     )
 
-    _run_rolling_sequence()
-
-    console.print("\n[dim]Dice sequence finished.[/dim]")
+    _run_rolling_sequence(live=True)
