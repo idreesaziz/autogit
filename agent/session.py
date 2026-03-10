@@ -1,7 +1,18 @@
-"""Core agent loop — read state → decide → act → commit → push."""
+"""Core agent loop — DNA-driven two-call architecture.
+
+Flow:
+  1. Load state + update DNA (AST scan → diff → annotate changed symbols)
+  2. Call 1: Send DNA + state → Gemini decides task + requests specific files
+  3. Read requested files from disk
+  4. Call 2: Send task + files → Gemini generates implementation
+  5. Write files, generate commit message
+  6. Update DNA for changed files (AST diff → describe new symbols)
+  7. Update memory / state, commit + push (including .dna)
+"""
 
 from __future__ import annotations
 
+import json
 import time
 from datetime import date
 from pathlib import Path
@@ -18,13 +29,17 @@ from config import (
     GEMINI_FALLBACK_MODEL,
     MAX_REQUESTS_PER_SESSION,
     REQUEST_DELAY_SECONDS,
-    MAX_CONTEXT_CHARS,
     MAX_FILE_CHARS,
-    MAX_CONTEXT_FILES,
 )
 from agent.memory import load_state, save_state, append_session_log
 from agent.coder import generate_file_content, generate_commit_message, parse_task_plan
-from github_ops.git_ops import get_recent_files, get_file_tree, commit_and_push
+from agent.dna import (
+    load_dna,
+    update_dna,
+    render_dna_context,
+    generate_initial_dna,
+)
+from github_ops.git_ops import commit_and_push
 from github_ops.api import update_last_session
 
 console = Console()
@@ -46,7 +61,6 @@ def _make_gemini_call(
     - Tracks requests_used in session_tracker
     - Retries on 429 (rate limit) up to 3 times with 60s wait
     - Falls back to GEMINI_FALLBACK_MODEL on quota errors
-    - Retries once on JSON parse failures with explicit instruction
     """
     tracker = session_tracker or {"requests_used": 0}
 
@@ -105,15 +119,20 @@ def run_session(
     mode: str = "auto",
     force: bool = False,
 ) -> dict[str, Any]:
-    """Run a single improvement session on a repo.
+    """Run a single DNA-driven improvement session on a repo.
+
+    Two-call architecture:
+      Call 1  — DNA + state → plan (task + files to read)
+      Call 2  — task + file contents → implementation
+      Post    — update DNA with any new/changed symbols
 
     Args:
         repo_local_path: Absolute path to the local clone.
-        mode: "auto" or "manual" (both run the same loop currently).
+        mode: "auto" or "manual".
         force: If True, skip the "already ran today" check.
 
     Returns:
-        Session summary dict with task, files_changed, commit_message, requests_used.
+        Session summary dict.
     """
     repo_local_path = Path(repo_local_path)
     tracker: dict[str, int] = {"requests_used": 0}
@@ -121,8 +140,8 @@ def run_session(
     def gemini_call(prompt: str, system: str = "") -> str:
         return _make_gemini_call(prompt, system, tracker)
 
-    # ── Step 1: Load context ─────────────────────────────────────────
-    console.print("[bold]Step 1/6:[/bold] Loading project context…")
+    # ── Step 1: Load state + update DNA ──────────────────────────────
+    console.print("[bold]Step 1/7:[/bold] Loading state & updating DNA…")
 
     try:
         state = load_state(repo_local_path)
@@ -142,60 +161,61 @@ def run_session(
                 "requests_used": 0,
             }
 
-    recent_files = get_recent_files(repo_local_path)
-    file_tree = get_file_tree(repo_local_path)
+    # Update DNA — AST scan, diff against stored, annotate new/changed symbols
+    dna = load_dna(repo_local_path)
+    if not dna:
+        # First session or missing DNA — generate from scratch
+        console.print("[dim]No .dna found — generating initial DNA…[/dim]")
+        project_info = {
+            "name": state.get("repo_name", repo_local_path.name),
+            "description": state.get("project_description", ""),
+            "tech_stack": state.get("tech_stack", []),
+        }
+        dna = generate_initial_dna(repo_local_path, project_info, gemini_call)
+    else:
+        dna = update_dna(repo_local_path, gemini_call)
 
-    # Build context string: state + tree + file contents
-    context_parts: list[str] = [
-        "## Agent State\n```json\n" + _safe_json(state) + "\n```\n",
-        "## File Tree\n```\n" + file_tree + "\n```\n",
-    ]
-    chars_used = sum(len(p) for p in context_parts)
+    dna_context = render_dna_context(dna)
+    state_context = _safe_json(state)
 
-    context_parts.append("## Recent File Contents\n")
-    files_included = 0
-    for rel_path in recent_files:
-        if files_included >= MAX_CONTEXT_FILES:
-            break
-        full_path = repo_local_path / rel_path
-        if not full_path.is_file():
-            continue
-        try:
-            content = full_path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-        truncated = content[:MAX_FILE_CHARS]
-        chunk = f"### {rel_path}\n```\n{truncated}\n```\n"
-        if chars_used + len(chunk) > MAX_CONTEXT_CHARS:
-            break
-        context_parts.append(chunk)
-        chars_used += len(chunk)
-        files_included += 1
-
-    project_context = "".join(context_parts)
-
-    # ── Step 2: Decide what to do ────────────────────────────────────
-    console.print("[bold]Step 2/6:[/bold] Deciding next improvement…")
+    # ── Step 2: Call 1 — Decide task + request files ─────────────────
+    console.print("[bold]Step 2/7:[/bold] Planning next improvement (Call 1)…")
 
     decide_prompt = f"""You are an autonomous software development agent maintaining a GitHub repository.
-You will be given the current project state and recent code. Your job is to decide
-the single most valuable incremental improvement to make today.
+Below is the complete DNA map of the codebase (every file, every function/class signature,
+and a description of each symbol), plus the agent's memory/state.
+
+Your job: decide the single most valuable incremental improvement to make today.
+Then specify which files you need to READ to implement it.
 
 Rules:
 - Make ONE focused improvement (not multiple unrelated changes)
-- The change must be implementable in this session
-- Prefer improvements that make the project more useful to real developers
-- Consider: adding tests, improving docs, fixing edge cases, adding a feature, improving error messages
-- Output a JSON plan with: {{ "task": "...", "rationale": "...", "files_to_create": [...], "files_to_modify": [...] }}
+- Prefer improvements that advance the current roadmap phase
+- Consider: adding tests, improving docs, fixing edge cases, adding features, refactoring
+- You already know every declaration and its purpose from the DNA — choose wisely
+- Request the MINIMUM files needed (you'll see their full source in the next step)
 
-Return ONLY valid JSON, no markdown fences, no extra text.
+## DNA
+{dna_context}
 
-{project_context}"""
+## Agent State
+```json
+{state_context}
+```
+
+Return ONLY valid JSON (no markdown fences, no extra text):
+{{
+  "task": "one-line description of the improvement",
+  "rationale": "why this is the most valuable next step",
+  "files_to_read": ["path/to/file1.py", "path/to/file2.py"],
+  "files_to_create": ["new/file.py"],
+  "files_to_modify": ["existing/file.py"]
+}}"""
 
     raw_plan = gemini_call(decide_prompt, system="You are a senior software architect.")
     plan = parse_task_plan(raw_plan)
 
-    # Retry once with explicit JSON instruction if parse fell back
+    # Retry once if parse failed
     if plan.get("rationale", "").startswith("Fallback"):
         retry_prompt = decide_prompt + "\n\nIMPORTANT: Respond ONLY with valid JSON. No markdown, no explanation."
         raw_plan = gemini_call(retry_prompt, system="You are a senior software architect.")
@@ -204,29 +224,53 @@ Return ONLY valid JSON, no markdown fences, no extra text.
     task_desc = plan.get("task", "General improvement")
     console.print(f"  [cyan]Task:[/cyan] {task_desc}")
 
-    # ── Step 3: Implement ────────────────────────────────────────────
-    console.print("[bold]Step 3/6:[/bold] Generating code changes…")
+    # ── Step 3: Read requested files ─────────────────────────────────
+    console.print("[bold]Step 3/7:[/bold] Reading requested files…")
 
-    all_files = list(plan.get("files_to_create", [])) + list(plan.get("files_to_modify", []))
-    if not all_files:
-        all_files = ["README.md"]  # sensible fallback
+    files_to_read = list(plan.get("files_to_read", []))
+    # Also include files_to_modify (agent needs to see current content)
+    for f in plan.get("files_to_modify", []):
+        if f not in files_to_read:
+            files_to_read.append(f)
+
+    file_contents: dict[str, str] = {}
+    for rel_path in files_to_read:
+        full_path = repo_local_path / rel_path
+        if not full_path.is_file():
+            continue
+        try:
+            content = full_path.read_text(encoding="utf-8", errors="replace")
+            file_contents[rel_path] = content[:MAX_FILE_CHARS * 3]  # generous limit for targeted reads
+            console.print(f"  [dim]Read {rel_path} ({len(content)} chars)[/dim]")
+        except OSError:
+            continue
+
+    # ── Step 4: Call 2 — Generate implementation ─────────────────────
+    console.print("[bold]Step 4/7:[/bold] Generating implementation (Call 2)…")
+
+    all_target_files = list(plan.get("files_to_create", [])) + list(plan.get("files_to_modify", []))
+    if not all_target_files:
+        all_target_files = ["README.md"]
 
     written_files: list[str] = []
-    for rel_path in all_files:
+    for rel_path in all_target_files:
         full_path = repo_local_path / rel_path
-        current = None
-        if full_path.exists():
+        current = file_contents.get(rel_path)
+        if current is None and full_path.exists():
             try:
                 current = full_path.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 pass
+
+        # Build file-specific context from DNA + read files
+        file_context = _build_implementation_context(rel_path, task_desc, file_contents, dna_context)
 
         try:
             new_content = generate_file_content(
                 task=task_desc,
                 file_path=rel_path,
                 current_content=current,
-                project_context=project_context,
+                project_context=file_context,
                 gemini_call=gemini_call,
             )
         except (BudgetExhaustedError, GeminiCallError) as exc:
@@ -247,8 +291,8 @@ Return ONLY valid JSON, no markdown fences, no extra text.
             "requests_used": tracker["requests_used"],
         }
 
-    # ── Step 4: Generate commit message ──────────────────────────────
-    console.print("[bold]Step 4/6:[/bold] Generating commit message…")
+    # ── Step 5: Generate commit message ──────────────────────────────
+    console.print("[bold]Step 5/7:[/bold] Generating commit message…")
 
     try:
         commit_msg = generate_commit_message(task_desc, written_files, gemini_call)
@@ -257,16 +301,24 @@ Return ONLY valid JSON, no markdown fences, no extra text.
 
     console.print(f"  [dim]{commit_msg}[/dim]")
 
-    # ── Step 5: Update memory ────────────────────────────────────────
-    console.print("[bold]Step 5/6:[/bold] Updating agent state…")
+    # ── Step 6: Update DNA for changed files ─────────────────────────
+    console.print("[bold]Step 6/7:[/bold] Updating DNA for changed files…")
+
+    try:
+        dna = update_dna(repo_local_path, gemini_call)
+        _advance_roadmap_phase(dna, state, gemini_call)
+    except (BudgetExhaustedError, GeminiCallError):
+        console.print("[yellow]DNA post-update skipped (budget).[/yellow]")
+
+    written_files.append(".dna")
+
+    # ── Step 7: Update memory, commit & push ─────────────────────────
+    console.print("[bold]Step 7/7:[/bold] Saving state, committing & pushing…")
 
     state["current_phase"] = task_desc
     state = append_session_log(state, task_desc, written_files, tracker["requests_used"])
     save_state(repo_local_path, state)
     written_files.append(".agent_state.json")
-
-    # ── Step 6: Commit and push ──────────────────────────────────────
-    console.print("[bold]Step 6/6:[/bold] Committing and pushing…")
 
     try:
         commit_and_push(repo_local_path, written_files, commit_msg)
@@ -300,9 +352,94 @@ Return ONLY valid JSON, no markdown fences, no extra text.
     return summary
 
 
+# ── Helpers ──────────────────────────────────────────────────────────
+
+def _build_implementation_context(
+    target_file: str,
+    task: str,
+    file_contents: dict[str, str],
+    dna_context: str,
+) -> str:
+    """Build context for Call 2 — targeted file contents + condensed DNA."""
+    parts: list[str] = [f"## DNA Overview\n{dna_context}\n"]
+
+    if file_contents:
+        parts.append("## Referenced Files\n")
+        for path, content in file_contents.items():
+            if path == target_file:
+                continue  # coder.py already injects current_content
+            parts.append(f"### {path}\n```\n{content}\n```\n")
+
+    return "".join(parts)
+
+
+def _advance_roadmap_phase(dna: dict, state: dict, gemini_call) -> None:
+    """Ask Gemini if the current roadmap phase is complete and advance if so."""
+    project = dna.get("project", {})
+    roadmap = project.get("roadmap", [])
+    current = project.get("current_phase", 1)
+
+    if not roadmap:
+        return
+
+    current_phase = None
+    for phase in roadmap:
+        if phase.get("phase") == current:
+            current_phase = phase
+            break
+
+    if not current_phase or current_phase.get("status") == "complete":
+        return
+
+    # Check with Gemini
+    phase_check_prompt = (
+        f"The project '{project.get('name', '?')}' is on phase {current}: "
+        f"'{current_phase.get('title', '?')}'.\n"
+        f"Description: {current_phase.get('description', '?')}\n\n"
+        f"Recent completed tasks from session log:\n"
+    )
+    for entry in state.get("session_log", [])[-5:]:
+        phase_check_prompt += f"  - {entry.get('task', '?')}\n"
+
+    phase_check_prompt += (
+        f"\nIs phase {current} complete? Reply ONLY with JSON: "
+        f'{{ "complete": true/false, "reason": "..." }}'
+    )
+
+    try:
+        raw = gemini_call(phase_check_prompt, system="You are a project manager.")
+        result = json.loads(_strip_json_fences(raw))
+        if result.get("complete"):
+            current_phase["status"] = "complete"
+            # Advance to next phase
+            for phase in roadmap:
+                if phase.get("phase") == current + 1:
+                    phase["status"] = "in-progress"
+                    project["current_phase"] = current + 1
+                    console.print(
+                        f"[bold green]🎯 Phase {current} complete! "
+                        f"Advancing to Phase {current + 1}: {phase.get('title', '?')}[/bold green]"
+                    )
+                    break
+            from agent.dna import save_dna
+            save_dna(Path(state.get("repo_url", "")).parent, dna)
+    except (json.JSONDecodeError, KeyError, Exception):
+        pass  # non-critical
+
+
+def _strip_json_fences(text: str) -> str:
+    """Remove markdown fences from JSON response."""
+    import re
+    text = text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z]*\n?", "", text)
+    if text.endswith("```"):
+        text = text[:-3]
+    return text.strip()
+
+
 def _safe_json(obj: Any) -> str:
     """JSON-serialise with truncation for large states."""
-    import json
     text = json.dumps(obj, indent=2, default=str)
     if len(text) > 4000:
         return text[:4000] + "\n... (truncated)"

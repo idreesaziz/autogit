@@ -49,7 +49,6 @@ GEMINI_FALLBACK_MODEL: str = "gemini-3-flash-preview"
 # ── Context caps ─────────────────────────────────────────────────────
 MAX_CONTEXT_CHARS: int = 15_000
 MAX_FILE_CHARS: int = 3_000
-MAX_CONTEXT_FILES: int = 5
 
 # ── Commit cadence weights (weekday → base probability) ─────────────
 WEEKDAY_BASE: dict[int, float] = {

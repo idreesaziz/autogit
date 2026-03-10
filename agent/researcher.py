@@ -17,6 +17,7 @@ from config import (
     MAX_CONTEXT_CHARS,
 )
 from agent.memory import initialize_state, save_state
+from agent.dna import generate_initial_dna
 from github_ops.api import create_repo, register_repo
 from github_ops.git_ops import init_repo, commit_and_push
 
@@ -166,10 +167,20 @@ Include a main source file with a minimal working skeleton."""
     save_state(local_path, state)
     written_files.append(".agent_state.json")
 
-    # 6. Commit and push
+    # 6. Generate initial DNA
+    project_info = {
+        "name": name,
+        "description": description,
+        "tech_stack": tech,
+        "tagline": tagline,
+    }
+    generate_initial_dna(local_path, project_info, gemini_call)
+    written_files.append(".dna")
+
+    # 7. Commit and push
     commit_and_push(local_path, written_files, "feat: initial project scaffold")
 
-    # 7. Register in managed_repos.json
+    # 8. Register in managed_repos.json
     register_repo(name, repo_url, local_path)
 
     return repo_url, local_path
