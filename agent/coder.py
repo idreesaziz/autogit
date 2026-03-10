@@ -76,23 +76,32 @@ def generate_commit_message(
     Returns:
         A single-line conventional commit message (e.g. 'feat: add config parser').
     """
-    prompt = f"""Generate a single-line conventional commit message for this change.
+    prompt = f"""Generate a single-line git commit message for this change.
 
 Task: {task}
 Files changed: {', '.join(files_changed)}
 
-Format: <type>: <short description>
-Types: feat, fix, docs, refactor, test, chore, style
+Rules:
+- Use conventional commit format: <type>: <short description>
+- Types: feat, fix, docs, refactor, test, chore, style
+- Write like a real developer — vary your wording naturally
+- Sometimes be terse ("fix: handle null case"), sometimes slightly more descriptive
+- NO emojis, NO unicode symbols, NO special characters — plain ASCII only
+- Lowercase, no period at the end
+- Do NOT start with generic filler like "implement" or "add support for" every time
+- Vary verbs: add, wire up, hook in, set up, drop, rework, clean up, flesh out, etc.
 
 Return ONLY the commit message line. No quotes, no explanation."""
 
     raw = gemini_call(
         prompt,
-        system="You write git commit messages.",
+        system="You write terse, natural-sounding git commit messages like a real developer. Never use emojis.",
     )
-    # Take just the first non-empty line
+    # Take just the first non-empty line and strip any emojis/non-ASCII
     for line in raw.strip().splitlines():
         line = line.strip().strip('"').strip("'")
+        # Remove any non-ASCII characters (emojis, unicode symbols)
+        line = line.encode("ascii", errors="ignore").decode("ascii").strip()
         if line:
             return line
     return "chore: update project files"

@@ -147,16 +147,34 @@ def _roll_dice(probability: float, session_num: int) -> bool:
 # ── Repo selection (weighted by recency) ────────────────────────────
 
 def _pick_repo() -> dict | None:
-    """Choose ONE repo for today, weighted so yesterday's repo is more likely."""
+    """Choose ONE repo for today, weighted so yesterday's repo is more likely.
+
+    Skips repos whose DNA marks them as mature.
+    """
+    from agent.dna import load_dna
+
     repos = list_managed_repos()
     if not repos:
         return None
-    if len(repos) == 1:
-        return repos[0]
+
+    # Filter out mature repos
+    active = []
+    for r in repos:
+        local = r.get("local_path", "")
+        if local:
+            dna = load_dna(local)
+            if dna and dna.get("project", {}).get("mature"):
+                continue
+        active.append(r)
+
+    if not active:
+        return None
+    if len(active) == 1:
+        return active[0]
 
     yesterday = (date.today().toordinal() - 1)
     weights: list[float] = []
-    for r in repos:
+    for r in active:
         w = 1.0
         try:
             last = r.get("last_session", "")
@@ -166,7 +184,7 @@ def _pick_repo() -> dict | None:
             pass
         weights.append(w)
 
-    chosen = random.choices(repos, weights=weights, k=1)[0]
+    chosen = random.choices(active, weights=weights, k=1)[0]
     return chosen
 
 

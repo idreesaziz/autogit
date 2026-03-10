@@ -526,39 +526,94 @@ def annotate_files(
 ) -> dict[str, dict]:
     """Call Gemini to describe symbols in the given files.
 
-    Only annotates symbols that have empty descriptions.
+    Batches all files into a single Gemini call to minimise API usage.
     Returns updated file entries.
     """
     repo_path = Path(repo_path)
+
+    # Collect per-file prompts, then merge into one batched call
+    file_sections: list[str] = []
+    annotatable_files: list[str] = []
 
     for rel_path in files_to_annotate:
         entry = file_entries.get(rel_path)
         if not entry:
             continue
 
-        # Read source for context
         full_path = repo_path / rel_path
         try:
             source = full_path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
 
-        prompt = _build_annotation_prompt(rel_path, entry, source)
-        if not prompt:
-            continue  # nothing to annotate
+        section = _build_annotation_section(rel_path, entry, source)
+        if not section:
+            continue
 
-        try:
-            raw = gemini_call(
-                prompt,
-                system="You are a code documentation expert. Be concise — one sentence per symbol.",
-            )
-            # Parse response
-            annotations = _parse_annotation_response(raw)
-            file_entries[rel_path] = _apply_annotations(entry, annotations)
-        except Exception as exc:
-            console.print(f"[yellow]DNA annotation failed for {rel_path}: {exc}[/yellow]")
+        file_sections.append(section)
+        annotatable_files.append(rel_path)
+
+    if not file_sections:
+        return file_entries
+
+    batched_prompt = (
+        "Describe the purpose and symbols for each file below.\n"
+        "Return ONLY valid JSON (no markdown fences) with this structure:\n"
+        '{"files": {"<relative_path>": {"file_purpose": "...", "symbols": {"<name>": "one-line desc", ...}}, ...}}\n\n'
+        + "\n---\n".join(file_sections)
+    )
+
+    try:
+        raw = gemini_call(
+            batched_prompt,
+            system="You are a code documentation expert. Be concise — one sentence per symbol.",
+        )
+        parsed = _parse_annotation_response(raw)
+        files_data = parsed.get("files", parsed)  # tolerate flat or nested
+
+        for rel_path in annotatable_files:
+            annotations = files_data.get(rel_path, {})
+            if annotations:
+                file_entries[rel_path] = _apply_annotations(file_entries[rel_path], annotations)
+    except Exception as exc:
+        console.print(f"[yellow]DNA batch annotation failed: {exc}[/yellow]")
 
     return file_entries
+
+
+def _build_annotation_section(file_path: str, file_entry: dict, source: str) -> str:
+    """Build a section for the batched annotation prompt for one file."""
+    if file_entry.get("type") == "non-python":
+        return (
+            f"### File: `{file_path}`\n"
+            f"```\n{source[:2000]}\n```\n"
+            f"Describe what this file does."
+        )
+
+    symbols_to_describe: list[str] = []
+    for func_name, info in file_entry.get("functions", {}).items():
+        if not info.get("description"):
+            symbols_to_describe.append(f"function `{info['signature']}`")
+    for cls_name, info in file_entry.get("classes", {}).items():
+        if not info.get("description"):
+            symbols_to_describe.append(f"class `{cls_name}`")
+        for method_name, m_info in info.get("methods", {}).items():
+            if not m_info.get("description"):
+                symbols_to_describe.append(f"method `{cls_name}.{m_info['signature']}`")
+    for const_name, info in file_entry.get("constants", {}).items():
+        if not info.get("description"):
+            symbols_to_describe.append(f"constant `{const_name}`")
+
+    if not symbols_to_describe:
+        return ""
+
+    symbols_list = "\n".join(f"- {s}" for s in symbols_to_describe)
+    return (
+        f"### File: `{file_path}`\n"
+        f"Symbols:\n{symbols_list}\n\n"
+        f"```python\n{source[:3000]}\n```\n"
+        f"Write a one-sentence purpose for the file and describe each symbol."
+    )
 
 
 def _parse_annotation_response(raw: str) -> dict:

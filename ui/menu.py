@@ -77,12 +77,12 @@ def _handle_create_repo() -> None:
     def gemini_call(prompt: str, system: str = "") -> str:
         return _make_gemini_call(prompt, system, tracker)
 
-    with Status("[bold cyan]Researching trending ideas…[/bold cyan]", console=console):
-        try:
-            ideas = research_trending_ideas(gemini_call)
-        except (BudgetExhaustedError, GeminiCallError) as exc:
-            console.print(f"[red]Research failed: {exc}[/red]")
-            return
+    console.print("[bold cyan]Researching trending ideas…[/bold cyan]")
+    try:
+        ideas = research_trending_ideas(gemini_call)
+    except (BudgetExhaustedError, GeminiCallError) as exc:
+        console.print(f"[red]Research failed: {exc}[/red]")
+        return
 
     if not ideas:
         console.print("[yellow]No ideas generated. Try again later.[/yellow]")
@@ -121,12 +121,12 @@ def _handle_create_repo() -> None:
 
         # ── Regenerate ───────────────────────────────────────────
         if raw_choice.lower() == "r":
-            with Status("[bold cyan]Regenerating ideas…[/bold cyan]", console=console):
-                try:
-                    ideas = research_trending_ideas(gemini_call)
-                except (BudgetExhaustedError, GeminiCallError) as exc:
-                    console.print(f"[red]Regeneration failed: {exc}[/red]")
-                    return
+            console.print("[bold cyan]Regenerating ideas…[/bold cyan]")
+            try:
+                ideas = research_trending_ideas(gemini_call)
+            except (BudgetExhaustedError, GeminiCallError) as exc:
+                console.print(f"[red]Regeneration failed: {exc}[/red]")
+                return
             if not ideas:
                 console.print("[yellow]No ideas generated. Try again later.[/yellow]")
                 return
@@ -137,12 +137,12 @@ def _handle_create_repo() -> None:
             hint = Prompt.ask("Describe what you want to build")
             if not hint.strip():
                 continue
-            with Status("[bold cyan]Generating ideas from your suggestion…[/bold cyan]", console=console):
-                try:
-                    ideas = generate_ideas_from_hint(hint, gemini_call)
-                except (BudgetExhaustedError, GeminiCallError) as exc:
-                    console.print(f"[red]Generation failed: {exc}[/red]")
-                    return
+            console.print("[bold cyan]Generating ideas from your suggestion…[/bold cyan]")
+            try:
+                ideas = generate_ideas_from_hint(hint, gemini_call)
+            except (BudgetExhaustedError, GeminiCallError) as exc:
+                console.print(f"[red]Generation failed: {exc}[/red]")
+                return
             if not ideas:
                 console.print("[yellow]No ideas generated. Try again later.[/yellow]")
                 return
@@ -197,7 +197,7 @@ def _handle_work_on_repo() -> None:
 
     console.print(f"\n[bold]Running {session_mode} session on:[/bold] {repo['name']}")
     try:
-        result = run_session(repo["local_path"], mode="manual", session_mode=session_mode)
+        result = run_session(repo["local_path"], mode="manual", force=True, session_mode=session_mode)
         if result.get("reverted"):
             console.print(f"[yellow]Session reverted: {result.get('reason', 'unknown')}[/yellow]")
     except FileNotFoundError as exc:

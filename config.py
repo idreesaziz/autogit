@@ -40,7 +40,7 @@ TIMEZONE: str = os.getenv("TIMEZONE", "Europe/London")
 
 # ── Rate-limit / budget constants ────────────────────────────────────
 MAX_REQUESTS_PER_SESSION: int = 40
-REQUEST_DELAY_SECONDS: int = 13  # 5 RPM → 12s min; 13s gives buffer
+REQUEST_DELAY_SECONDS: int = 5  # short delay to avoid hitting burst limits
 
 # ── Gemini model names ───────────────────────────────────────────────
 GEMINI_PRIMARY_MODEL: str = "gemini-3.1-pro-preview"

@@ -87,6 +87,7 @@ def _make_gemini_call(
         try:
             config = types.GenerateContentConfig(
                 system_instruction=system or None,
+                http_options=types.HttpOptions(timeout=120_000),  # 120s
             )
             response = _gemini_client.models.generate_content(
                 model=model_name,
@@ -170,6 +171,18 @@ def run_session(
 
     # Update DNA
     dna = load_dna(repo_local_path)
+
+    # Maturity check: skip if all roadmap phases are done (unless forced)
+    if not force and dna:
+        if dna.get("project", {}).get("mature"):
+            console.print("[green]Project has reached full maturity — nothing to do.[/green]")
+            return {
+                "task": "(skipped — project mature)",
+                "files_changed": [],
+                "commit_message": "",
+                "requests_used": 0,
+            }
+
     if not dna:
         console.print("[dim]No .dna found — generating initial DNA…[/dim]")
         project_info = {
@@ -283,7 +296,7 @@ def run_session(
 
     try:
         dna = update_dna(repo_local_path, gemini_call)
-        _advance_roadmap_phase(dna, state, gemini_call)
+        _advance_roadmap_phase(dna, state, gemini_call, repo_local_path)
     except (BudgetExhaustedError, GeminiCallError):
         console.print("[yellow]DNA post-update skipped (budget).[/yellow]")
 
