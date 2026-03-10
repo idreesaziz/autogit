@@ -26,9 +26,11 @@ console = Console()
 
 # ── Trending scraper ─────────────────────────────────────────────────
 
-def _scrape_trending(since: str = "daily") -> list[dict[str, str]]:
+def _scrape_trending(since: str = "daily", language: str = "") -> list[dict[str, str]]:
     """Scrape GitHub trending page and return repo metadata."""
     url = "https://github.com/trending"
+    if language:
+        url = f"https://github.com/trending/{language}"
     params = {"since": since} if since != "daily" else {}
     try:
         resp = requests.get(url, params=params, timeout=15, headers={
@@ -68,41 +70,62 @@ def _scrape_trending(since: str = "daily") -> list[dict[str, str]]:
 
 
 def research_trending_ideas(gemini_call) -> list[dict[str, Any]]:
-    """Scrape trending repos and ask Gemini for project ideas.
+    """Scrape trending repos across multiple categories and ask Gemini for ideas.
 
-    Args:
-        gemini_call: The rate-limited Gemini call function from session.py.
+    Scrapes overall trending plus language-specific pages to get diverse input.
     """
-    console.print("[dim]Scraping GitHub trending (daily)…[/dim]")
-    daily = _scrape_trending("daily")
-    console.print("[dim]Scraping GitHub trending (weekly)…[/dim]")
-    weekly = _scrape_trending("weekly")
+    # Scrape diverse categories for breadth
+    categories = [
+        ("daily", ""),           # overall daily
+        ("weekly", ""),          # overall weekly
+        ("daily", "python"),     # Python-specific
+        ("daily", "javascript"), # JS-specific
+        ("daily", "go"),         # Go-specific
+        ("daily", "rust"),       # Rust-specific
+    ]
 
-    trending_text = "## Daily Trending Repos\n"
-    for r in daily:
-        trending_text += f"- {r['name']} ({r['language']}): {r['description']} [{r['stars_today']}]\n"
-    trending_text += "\n## Weekly Trending Repos\n"
-    for r in weekly:
+    all_repos: list[dict[str, str]] = []
+    seen_names: set[str] = set()
+
+    console.print("[dim]Scraping GitHub trending (multiple categories)\u2026[/dim]")
+    for since, lang in categories:
+        repos = _scrape_trending(since, lang)
+        for r in repos[:8]:  # top 8 per category
+            if r["name"] not in seen_names:
+                seen_names.add(r["name"])
+                all_repos.append(r)
+
+    trending_text = "## Trending Repos (across languages and timeframes)\n"
+    for r in all_repos:
         trending_text += f"- {r['name']} ({r['language']}): {r['description']} [{r['stars_today']}]\n"
 
     # Cap context to avoid oversized prompt
     trending_text = trending_text[:MAX_CONTEXT_CHARS]
 
-    prompt = f"""You are analyzing GitHub trending repositories to find gaps and opportunities.
-Given these trending repos, identify 5-6 project ideas that:
-- Complement or improve on what's trending (not copy it)
-- Are small enough for one developer to build incrementally over weeks
-- Would genuinely be useful to other developers
-- Can be built in Python, JavaScript, or TypeScript
-- Have a clear, searchable name and purpose
+    prompt = f"""Look at what's trending on GitHub and come up with 6 project ideas for a solo developer.
 
-Trending data:
+Trending repos right now:
 {trending_text}
+
+CRITICAL RULES:
+1. Each idea MUST be from a completely different field. Use this exact spread — one idea per row:
+   - Row 1: Something related to data or ML (training, datasets, pipelines, model inference)
+   - Row 2: A CLI tool or developer utility (not AI-related)
+   - Row 3: A web app, API, or web framework
+   - Row 4: Something in DevOps, infrastructure, or monitoring
+   - Row 5: A visualization, UI, or dashboard tool
+   - Row 6: Wild card — pick any niche: embedded, fintech, game dev, science, audio, networking, etc.
+
+2. AT MOST one idea can involve AI agents. The rest must NOT be about agents, LLMs, or AI wrappers.
+3. Don't rehash what's already trending — find GAPS that trending repos reveal.
+4. No sandboxes, no audit loggers, no agent tracers — think beyond the obvious.
+5. Each project must be buildable by one person incrementally over weeks.
+6. Python, JavaScript, or TypeScript only.
 
 Return ONLY a JSON array (no markdown fences, no explanation):
 [{{"name": "repo-name", "tagline": "one line", "description": "2-3 sentences", "tech": ["Python"], "why_now": "why this is timely"}}]"""
 
-    raw = gemini_call(prompt, system="You are a developer-tool analyst.")
+    raw = gemini_call(prompt, system="You are a veteran open-source developer who has shipped projects in ML, web dev, DevOps, embedded systems, and data viz. You think broadly, not just about the latest AI hype.")
     return _parse_json_array(raw)
 
 

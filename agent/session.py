@@ -747,13 +747,16 @@ def _revert_changes(repo_path: Path, written_files: list[str]) -> None:
                 pass
 
 
-def _advance_roadmap_phase(dna: dict, state: dict, gemini_call) -> None:
-    """Ask Gemini if the current roadmap phase is complete and advance if so."""
+def _advance_roadmap_phase(dna: dict, state: dict, gemini_call, repo_path: Path | None = None) -> None:
+    """Ask Gemini if the current roadmap phase is complete and advance if so.
+
+    When the final phase completes, marks the project as mature.
+    """
     project = dna.get("project", {})
     roadmap = project.get("roadmap", [])
     current = project.get("current_phase", 1)
 
-    if not roadmap:
+    if not roadmap or project.get("mature"):
         return
 
     current_phase = None
@@ -785,18 +788,31 @@ def _advance_roadmap_phase(dna: dict, state: dict, gemini_call) -> None:
         result = json.loads(_strip_json_fences(raw))
         if result.get("complete"):
             current_phase["status"] = "complete"
-            # Advance to next phase
+            # Try to advance to next phase
+            next_phase = None
             for phase in roadmap:
                 if phase.get("phase") == current + 1:
-                    phase["status"] = "in-progress"
-                    project["current_phase"] = current + 1
-                    console.print(
-                        f"[bold green]🎯 Phase {current} complete! "
-                        f"Advancing to Phase {current + 1}: {phase.get('title', '?')}[/bold green]"
-                    )
+                    next_phase = phase
                     break
-            from agent.dna import save_dna
-            save_dna(Path(state.get("repo_url", "")).parent, dna)
+
+            if next_phase:
+                next_phase["status"] = "in-progress"
+                project["current_phase"] = current + 1
+                console.print(
+                    f"[bold green]Phase {current} complete! "
+                    f"Advancing to Phase {current + 1}: {next_phase.get('title', '?')}[/bold green]"
+                )
+            else:
+                # All phases done -- project is mature
+                project["mature"] = True
+                console.print(
+                    f"[bold green]All {len(roadmap)} roadmap phases complete! "
+                    f"Project '{project.get('name', '?')}' marked as mature.[/bold green]"
+                )
+
+            if repo_path:
+                from agent.dna import save_dna
+                save_dna(repo_path, dna)
     except (json.JSONDecodeError, KeyError, Exception):
         pass  # non-critical
 
