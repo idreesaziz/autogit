@@ -86,3 +86,48 @@ def _save_managed(repos: list[dict[str, Any]]) -> None:
     _MANAGED_REPOS_FILE.parent.mkdir(parents=True, exist_ok=True)
     with open(_MANAGED_REPOS_FILE, "w", encoding="utf-8") as f:
         json.dump({"repos": repos}, f, indent=2, ensure_ascii=False)
+
+
+# ── GitHub Issues ────────────────────────────────────────────────────
+
+def create_issue(repo_name: str, title: str, body: str = "") -> int | None:
+    """Create a GitHub issue on a managed repo.
+
+    Args:
+        repo_name: Short repo name (not full owner/name).
+        title: Issue title.
+        body: Issue body/description.
+
+    Returns:
+        Issue number, or None if creation failed.
+    """
+    try:
+        gh = get_github_client()
+        repo = gh.get_repo(f"{GITHUB_USERNAME}/{repo_name}")
+        issue = repo.create_issue(title=title, body=body)
+        console.print(f"  [green]Created issue #{issue.number}:[/green] {title}")
+        return issue.number
+    except GithubException as exc:
+        console.print(f"[yellow]Could not create issue: {exc}[/yellow]")
+        return None
+
+
+def close_issue(repo_name: str, issue_number: int) -> bool:
+    """Close a GitHub issue by number.
+
+    Args:
+        repo_name: Short repo name.
+        issue_number: The issue number to close.
+
+    Returns:
+        True if closed successfully.
+    """
+    try:
+        gh = get_github_client()
+        repo = gh.get_repo(f"{GITHUB_USERNAME}/{repo_name}")
+        issue = repo.get_issue(number=issue_number)
+        issue.edit(state="closed")
+        return True
+    except GithubException as exc:
+        console.print(f"[yellow]Could not close issue #{issue_number}: {exc}[/yellow]")
+        return False

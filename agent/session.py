@@ -39,8 +39,9 @@ from agent.dna import (
     render_dna_context,
     generate_initial_dna,
 )
+from agent.validator import validate_source, format_errors_for_retry
 from github_ops.git_ops import commit_and_push
-from github_ops.api import update_last_session
+from github_ops.api import update_last_session, create_issue, close_issue
 
 console = Console()
 
@@ -224,6 +225,16 @@ Return ONLY valid JSON (no markdown fences, no extra text):
     task_desc = plan.get("task", "General improvement")
     console.print(f"  [cyan]Task:[/cyan] {task_desc}")
 
+    # ── Step 2.5: Create GitHub Issue for this task ──────────────────
+    repo_name = state.get("repo_name", repo_local_path.name)
+    issue_number = None
+    try:
+        issue_number = create_issue(repo_name, task_desc, plan.get("rationale", ""))
+        if issue_number:
+            console.print(f"  [dim]Opened issue #{issue_number}[/dim]")
+    except Exception:
+        pass  # non-critical
+
     # ── Step 3: Read requested files ─────────────────────────────────
     console.print("[bold]Step 3/7:[/bold] Reading requested files…")
 
@@ -245,7 +256,7 @@ Return ONLY valid JSON (no markdown fences, no extra text):
         except OSError:
             continue
 
-    # ── Step 4: Call 2 — Generate implementation ─────────────────────
+    # ── Step 4: Call 2 — Generate implementation + validate ──────────
     console.print("[bold]Step 4/7:[/bold] Generating implementation (Call 2)…")
 
     all_target_files = list(plan.get("files_to_create", [])) + list(plan.get("files_to_modify", []))
@@ -277,6 +288,32 @@ Return ONLY valid JSON (no markdown fences, no extra text):
             console.print(f"[yellow]Stopping file generation: {exc}[/yellow]")
             break
 
+        # Validate generated content
+        errors = validate_source(rel_path, new_content)
+        if errors:
+            console.print(f"  [yellow]⚠ Validation errors in {rel_path}:[/yellow]")
+            for err in errors:
+                console.print(f"    [dim]{err}[/dim]")
+
+            # Retry once with error feedback
+            retry_context = file_context + format_errors_for_retry(rel_path, errors)
+            try:
+                new_content = generate_file_content(
+                    task=task_desc,
+                    file_path=rel_path,
+                    current_content=current,
+                    project_context=retry_context,
+                    gemini_call=gemini_call,
+                )
+                errors = validate_source(rel_path, new_content)
+                if errors:
+                    console.print(f"  [red]✗ {rel_path} still invalid after retry — skipping[/red]")
+                    continue
+                console.print(f"  [green]✓ {rel_path} fixed on retry[/green]")
+            except (BudgetExhaustedError, GeminiCallError) as exc:
+                console.print(f"  [red]✗ Retry failed for {rel_path}: {exc} — skipping[/red]")
+                continue
+
         full_path.parent.mkdir(parents=True, exist_ok=True)
         full_path.write_text(new_content, encoding="utf-8")
         written_files.append(rel_path)
@@ -298,6 +335,10 @@ Return ONLY valid JSON (no markdown fences, no extra text):
         commit_msg = generate_commit_message(task_desc, written_files, gemini_call)
     except (BudgetExhaustedError, GeminiCallError):
         commit_msg = "chore: automated improvement"
+
+    # Append issue reference to close it via commit
+    if issue_number:
+        commit_msg += f" (closes #{issue_number})"
 
     console.print(f"  [dim]{commit_msg}[/dim]")
 
@@ -328,7 +369,6 @@ Return ONLY valid JSON (no markdown fences, no extra text):
         console.print("[yellow]Changes are committed locally. Re-run or push manually.[/yellow]")
 
     # Update managed_repos.json
-    repo_name = state.get("repo_name", repo_local_path.name)
     update_last_session(repo_name)
 
     # ── Session summary ──────────────────────────────────────────────
