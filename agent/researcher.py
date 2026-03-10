@@ -106,6 +106,33 @@ Return ONLY a JSON array (no markdown fences, no explanation):
     return _parse_json_array(raw)
 
 
+def generate_ideas_from_hint(
+    hint: str,
+    gemini_call,
+) -> list[dict[str, Any]]:
+    """Generate project ideas based on a user-provided suggestion/hint.
+
+    Args:
+        hint: Free-text description of what the user wants.
+        gemini_call: Rate-limited Gemini call function.
+    """
+    prompt = f"""A developer wants to create a new open-source project.  They gave this hint:
+
+\"{hint}\"
+
+Generate 5-6 concrete project ideas inspired by this hint.  Each idea should:
+- Be small enough for one developer to build incrementally over weeks
+- Be genuinely useful to other developers or end-users
+- Can be built in Python, JavaScript, or TypeScript
+- Have a clear, searchable name and purpose
+
+Return ONLY a JSON array (no markdown fences, no explanation):
+[{{"name": "repo-name", "tagline": "one line", "description": "2-3 sentences", "tech": ["Python"], "why_now": "why this idea is valuable"}}]"""
+
+    raw = gemini_call(prompt, system="You are a developer-tool analyst.")
+    return _parse_json_array(raw)
+
+
 # ── New repo creation ────────────────────────────────────────────────
 
 def create_repo_from_idea(

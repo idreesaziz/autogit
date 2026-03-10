@@ -12,7 +12,7 @@ from rich.table import Table
 from rich.status import Status
 
 from agent.session import run_session, _make_gemini_call, BudgetExhaustedError, GeminiCallError
-from agent.researcher import research_trending_ideas, create_repo_from_idea
+from agent.researcher import research_trending_ideas, create_repo_from_idea, generate_ideas_from_hint
 from github_ops.api import list_managed_repos
 from agent.memory import load_state
 from config import LOCAL_REPOS_DIR
@@ -71,7 +71,7 @@ def show_menu() -> None:
 # ── Option 1: Create a new repo ─────────────────────────────────────
 
 def _handle_create_repo() -> None:
-    """Research trending ideas, let user pick, create repo."""
+    """Research trending ideas, let user pick, regenerate, or suggest."""
     tracker: dict[str, int] = {"requests_used": 0}
 
     def gemini_call(prompt: str, system: str = "") -> str:
@@ -88,50 +88,95 @@ def _handle_create_repo() -> None:
         console.print("[yellow]No ideas generated. Try again later.[/yellow]")
         return
 
-    # Display ideas in a table
-    table = Table(title="Project Ideas", show_lines=True)
-    table.add_column("#", style="bold", width=4)
-    table.add_column("Name", style="cyan", max_width=25)
-    table.add_column("Tagline", max_width=40)
-    table.add_column("Tech", style="green", max_width=15)
-    table.add_column("Why Now", style="dim", max_width=35)
+    while True:
+        # Display ideas in a table
+        table = Table(title="Project Ideas", show_lines=True)
+        table.add_column("#", style="bold", width=4)
+        table.add_column("Name", style="cyan", max_width=25)
+        table.add_column("Tagline", max_width=40)
+        table.add_column("Tech", style="green", max_width=15)
+        table.add_column("Why Now", style="dim", max_width=35)
 
-    for i, idea in enumerate(ideas, 1):
-        table.add_row(
-            str(i),
-            idea.get("name", "?"),
-            idea.get("tagline", ""),
-            ", ".join(idea.get("tech", [])),
-            idea.get("why_now", ""),
+        for i, idea in enumerate(ideas, 1):
+            table.add_row(
+                str(i),
+                idea.get("name", "?"),
+                idea.get("tagline", ""),
+                ", ".join(idea.get("tech", [])),
+                idea.get("why_now", ""),
+            )
+
+        console.print(table)
+        console.print(
+            "[dim]Enter a number to pick, [bold]R[/bold] to regenerate, "
+            "[bold]S[/bold] to suggest your own idea, or [bold]0[/bold] to cancel.[/dim]"
         )
 
-    console.print(table)
+        raw_choice = Prompt.ask("Choice").strip()
 
-    choice = IntPrompt.ask(
-        "Pick an idea to create (number, 0 to cancel)",
-        default=0,
-    )
-    if choice < 1 or choice > len(ideas):
-        console.print("[dim]Cancelled.[/dim]")
-        return
-
-    idea = ideas[choice - 1]
-    console.print(f"\n[bold]Creating repo:[/bold] {idea['name']}")
-
-    with Status("[bold cyan]Setting up repository…[/bold cyan]", console=console):
-        try:
-            repo_url, local_path = create_repo_from_idea(idea, gemini_call)
-        except Exception as exc:
-            console.print(f"[red]Repo creation failed: {exc}[/red]")
+        # ── Cancel ───────────────────────────────────────────────
+        if raw_choice == "0":
+            console.print("[dim]Cancelled.[/dim]")
             return
 
-    console.print(Panel(
-        f"[bold]Repo:[/bold]  {idea['name']}\n"
-        f"[bold]URL:[/bold]   {repo_url}\n"
-        f"[bold]Local:[/bold] {local_path}",
-        title="Repo Created",
-        border_style="green",
-    ))
+        # ── Regenerate ───────────────────────────────────────────
+        if raw_choice.lower() == "r":
+            with Status("[bold cyan]Regenerating ideas…[/bold cyan]", console=console):
+                try:
+                    ideas = research_trending_ideas(gemini_call)
+                except (BudgetExhaustedError, GeminiCallError) as exc:
+                    console.print(f"[red]Regeneration failed: {exc}[/red]")
+                    return
+            if not ideas:
+                console.print("[yellow]No ideas generated. Try again later.[/yellow]")
+                return
+            continue
+
+        # ── Suggest ──────────────────────────────────────────────
+        if raw_choice.lower() == "s":
+            hint = Prompt.ask("Describe what you want to build")
+            if not hint.strip():
+                continue
+            with Status("[bold cyan]Generating ideas from your suggestion…[/bold cyan]", console=console):
+                try:
+                    ideas = generate_ideas_from_hint(hint, gemini_call)
+                except (BudgetExhaustedError, GeminiCallError) as exc:
+                    console.print(f"[red]Generation failed: {exc}[/red]")
+                    return
+            if not ideas:
+                console.print("[yellow]No ideas generated. Try again later.[/yellow]")
+                return
+            continue
+
+        # ── Pick by number ───────────────────────────────────────
+        try:
+            choice = int(raw_choice)
+        except ValueError:
+            console.print("[yellow]Invalid input — enter a number, R, or S.[/yellow]")
+            continue
+
+        if choice < 1 or choice > len(ideas):
+            console.print("[yellow]Invalid choice.[/yellow]")
+            continue
+
+        idea = ideas[choice - 1]
+        console.print(f"\n[bold]Creating repo:[/bold] {idea['name']}")
+
+        with Status("[bold cyan]Setting up repository…[/bold cyan]", console=console):
+            try:
+                repo_url, local_path = create_repo_from_idea(idea, gemini_call)
+            except Exception as exc:
+                console.print(f"[red]Repo creation failed: {exc}[/red]")
+                return
+
+        console.print(Panel(
+            f"[bold]Repo:[/bold]  {idea['name']}\n"
+            f"[bold]URL:[/bold]   {repo_url}\n"
+            f"[bold]Local:[/bold] {local_path}",
+            title="Repo Created",
+            border_style="green",
+        ))
+        return  # done
 
 
 # ── Option 2: Work on an existing repo ──────────────────────────────
