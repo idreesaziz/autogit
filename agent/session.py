@@ -1,19 +1,16 @@
-"""Core agent loop — DNA-driven two-call architecture with oneshot/agentic modes.
+"""Core agent loop — DNA-driven architecture with oneshot/agentic modes.
 
 Modes:
-  oneshot — Plan → Generate → Validate → Push  (fast, 2-3 Gemini calls)
-  agentic — Plan → Generate → Validate → Test → Fix loop → Review → Fix loop → Push
+  oneshot — Plan (1 task) → Generate → Validate → Push  (fast, 2-3 Gemini calls)
+  agentic — Multi-step plan → per-subtask: Generate → Validate → Test → Fix → Review → Push
 
-Flow (shared steps 1-4, agentic adds 4a-4b):
-  1. Load state + update DNA (AST scan → diff → annotate changed symbols)
-  2. Call 1: Send DNA + state → Gemini decides task + requests specific files
-  3. Read requested files from disk
-  4. Call 2: Send task + files → Gemini generates implementation + validate
-  4a. [agentic] Run tests → if fail, feed errors to Gemini, retry up to 3x
-  4b. [agentic] Self-review → if issues, feed to Gemini, retry up to 3x
-  5. Generate commit message
-  6. Update DNA for changed files (AST diff → describe new symbols)
-  7. Update memory / state, commit + push (including .dna)
+Flow:
+  1. Load state + update DNA
+  2. Plan: oneshot gets 1 task; agentic gets 2-5 ordered subtasks
+  3. [per subtask] Read files → Generate → Validate → [agentic: test + review + fix]
+  4. Generate commit message
+  5. Update DNA
+  6. Save state, commit & push
 """
 
 from __future__ import annotations
@@ -133,12 +130,6 @@ def run_session(
 ) -> dict[str, Any]:
     """Run a single DNA-driven improvement session on a repo.
 
-    Two-call architecture:
-      Call 1  — DNA + state → plan (task + files to read)
-      Call 2  — task + file contents → implementation
-      [agentic] — test → fix loop → review → fix loop
-      Post    — update DNA with any new/changed symbols
-
     Args:
         repo_local_path: Absolute path to the local clone.
         mode: "auto" or "manual".
@@ -157,7 +148,7 @@ def run_session(
         return _make_gemini_call(prompt, system, tracker)
 
     # ── Step 1: Load state + update DNA ──────────────────────────────
-    console.print("[bold]Step 1/7:[/bold] Loading state & updating DNA…")
+    console.print(f"[bold]Step 1:[/bold] Loading state & updating DNA… [dim]({effective_mode} mode)[/dim]")
 
     try:
         state = load_state(repo_local_path)
@@ -177,10 +168,9 @@ def run_session(
                 "requests_used": 0,
             }
 
-    # Update DNA — AST scan, diff against stored, annotate new/changed symbols
+    # Update DNA
     dna = load_dna(repo_local_path)
     if not dna:
-        # First session or missing DNA — generate from scratch
         console.print("[dim]No .dna found — generating initial DNA…[/dim]")
         project_info = {
             "name": state.get("repo_name", repo_local_path.name),
@@ -193,13 +183,161 @@ def run_session(
 
     dna_context = render_dna_context(dna)
     state_context = _safe_json(state)
+    repo_name = state.get("repo_name", repo_local_path.name)
 
-    # ── Step 2: Call 1 — Decide task + request files ─────────────────
-    console.print("[bold]Step 2/7:[/bold] Planning next improvement (Call 1)…")
+    # ── Step 2: Plan ─────────────────────────────────────────────────
+    if is_agentic:
+        console.print("[bold]Step 2:[/bold] Building multi-step plan…")
+        subtasks = _plan_agentic(dna_context, state_context, gemini_call)
+        task_desc = subtasks[0].get("goal", "Multi-step improvement")
+        console.print(f"  [cyan]Goal:[/cyan] {task_desc}")
+        for i, st in enumerate(subtasks, 1):
+            console.print(f"  [dim]  {i}. {st.get('task', '?')}[/dim]")
+    else:
+        console.print("[bold]Step 2:[/bold] Planning next improvement…")
+        plan = _plan_oneshot(dna_context, state_context, gemini_call)
+        task_desc = plan.get("task", "General improvement")
+        console.print(f"  [cyan]Task:[/cyan] {task_desc}")
+        # Wrap single plan as one subtask so the execution path is uniform
+        subtasks = [plan]
 
+    # ── Step 2.5: Create GitHub Issue ────────────────────────────────
+    issue_number = None
+    try:
+        rationale = subtasks[0].get("rationale", "")
+        issue_body = rationale
+        if is_agentic and len(subtasks) > 1:
+            issue_body += "\n\n## Subtasks\n"
+            for i, st in enumerate(subtasks, 1):
+                issue_body += f"- [ ] {st.get('task', '?')}\n"
+        issue_number = create_issue(repo_name, task_desc, issue_body)
+        if issue_number:
+            console.print(f"  [dim]Opened issue #{issue_number}[/dim]")
+    except Exception:
+        pass  # non-critical
+
+    # ── Step 3: Execute subtasks ─────────────────────────────────────
+    all_written_files: list[str] = []
+    all_written_contents: dict[str, str] = {}
+    cumulative_file_contents: dict[str, str] = {}  # grows across subtasks
+
+    for idx, subtask in enumerate(subtasks):
+        step_num = idx + 1
+        step_total = len(subtasks)
+        sub_task_desc = subtask.get("task", task_desc)
+        console.print(
+            f"\n[bold]Step 3.{step_num}/{step_total}:[/bold] "
+            f"{'Generating implementation' if step_total == 1 else sub_task_desc}…"
+        )
+
+        try:
+            written, contents, file_ctx = _execute_subtask(
+                repo_local_path=repo_local_path,
+                subtask=subtask,
+                task_desc=sub_task_desc,
+                dna_context=dna_context,
+                cumulative_file_contents=cumulative_file_contents,
+                gemini_call=gemini_call,
+                is_agentic=is_agentic,
+                tracker=tracker,
+            )
+        except (BudgetExhaustedError, GeminiCallError) as exc:
+            console.print(f"[yellow]Budget exhausted at subtask {step_num} — stopping.[/yellow]")
+            break
+
+        if not written:
+            console.print(f"  [yellow]No files produced for subtask {step_num} — skipping.[/yellow]")
+            continue
+
+        all_written_files.extend(written)
+        all_written_contents.update(contents)
+        cumulative_file_contents.update(file_ctx)
+        # Also update cumulative with what was just written so next subtask sees it
+        for fp, c in contents.items():
+            cumulative_file_contents[fp] = c
+
+    if not all_written_files:
+        console.print("[yellow]No files were written — aborting session.[/yellow]")
+        return {
+            "task": task_desc,
+            "files_changed": [],
+            "commit_message": "",
+            "requests_used": tracker["requests_used"],
+        }
+
+    # ── Step 4: Generate commit message ──────────────────────────────
+    console.print("[bold]Step 4:[/bold] Generating commit message…")
+
+    try:
+        commit_msg = generate_commit_message(task_desc, all_written_files, gemini_call)
+    except (BudgetExhaustedError, GeminiCallError):
+        commit_msg = "chore: automated improvement"
+
+    if issue_number:
+        commit_msg += f" (closes #{issue_number})"
+
+    console.print(f"  [dim]{commit_msg}[/dim]")
+
+    # ── Step 5: Update DNA ───────────────────────────────────────────
+    console.print("[bold]Step 5:[/bold] Updating DNA for changed files…")
+
+    try:
+        dna = update_dna(repo_local_path, gemini_call)
+        _advance_roadmap_phase(dna, state, gemini_call)
+    except (BudgetExhaustedError, GeminiCallError):
+        console.print("[yellow]DNA post-update skipped (budget).[/yellow]")
+
+    all_written_files.append(".dna")
+
+    # ── Step 6: Save state, commit & push ────────────────────────────
+    console.print("[bold]Step 6:[/bold] Saving state, committing & pushing…")
+
+    state["current_phase"] = task_desc
+    state = append_session_log(state, task_desc, all_written_files, tracker["requests_used"])
+    save_state(repo_local_path, state)
+    all_written_files.append(".agent_state.json")
+
+    try:
+        commit_and_push(repo_local_path, all_written_files, commit_msg)
+        console.print("[green]Pushed successfully.[/green]")
+    except Exception as exc:
+        console.print(f"[red]Git push failed: {exc}[/red]")
+        console.print("[yellow]Changes are committed locally. Re-run or push manually.[/yellow]")
+
+    update_last_session(repo_name)
+
+    # ── Session summary ──────────────────────────────────────────────
+    subtask_count = len(subtasks)
+    summary = {
+        "task": task_desc,
+        "files_changed": all_written_files,
+        "commit_message": commit_msg,
+        "requests_used": tracker["requests_used"],
+        "session_mode": effective_mode,
+        "subtasks": subtask_count,
+    }
+
+    subtask_line = f" ({subtask_count} subtasks)" if subtask_count > 1 else ""
+    console.print(Panel(
+        f"[bold]Repo:[/bold]     {repo_name}\n"
+        f"[bold]Mode:[/bold]     {effective_mode}{subtask_line}\n"
+        f"[bold]Task:[/bold]     {task_desc}\n"
+        f"[bold]Files:[/bold]    {', '.join(all_written_files)}\n"
+        f"[bold]Commit:[/bold]   {commit_msg}\n"
+        f"[bold]Requests:[/bold] {tracker['requests_used']} used",
+        title="Session Complete",
+        border_style="green",
+    ))
+
+    return summary
+
+
+# ── Planning ─────────────────────────────────────────────────────────
+
+def _plan_oneshot(dna_context: str, state_context: str, gemini_call) -> dict:
+    """Oneshot: single task plan (original behaviour)."""
     decide_prompt = f"""You are an autonomous software development agent maintaining a GitHub repository.
-Below is the complete DNA map of the codebase (every file, every function/class signature,
-and a description of each symbol), plus the agent's memory/state.
+Below is the complete DNA map of the codebase and the agent's memory/state.
 
 Your job: decide the single most valuable incremental improvement to make today.
 Then specify which files you need to READ to implement it.
@@ -207,9 +345,8 @@ Then specify which files you need to READ to implement it.
 Rules:
 - Make ONE focused improvement (not multiple unrelated changes)
 - Prefer improvements that advance the current roadmap phase
-- Consider: adding tests, improving docs, fixing edge cases, adding features, refactoring
-- You already know every declaration and its purpose from the DNA — choose wisely
-- Request the MINIMUM files needed (you'll see their full source in the next step)
+- You already know every declaration from the DNA — choose wisely
+- Request the MINIMUM files needed
 
 ## DNA
 {dna_context}
@@ -223,63 +360,172 @@ Return ONLY valid JSON (no markdown fences, no extra text):
 {{
   "task": "one-line description of the improvement",
   "rationale": "why this is the most valuable next step",
-  "files_to_read": ["path/to/file1.py", "path/to/file2.py"],
+  "files_to_read": ["path/to/file1.py"],
   "files_to_create": ["new/file.py"],
   "files_to_modify": ["existing/file.py"]
 }}"""
 
-    raw_plan = gemini_call(decide_prompt, system="You are a senior software architect.")
-    plan = parse_task_plan(raw_plan)
+    raw = gemini_call(decide_prompt, system="You are a senior software architect.")
+    plan = parse_task_plan(raw)
+
+    if plan.get("rationale", "").startswith("Fallback"):
+        retry_prompt = decide_prompt + "\n\nIMPORTANT: Respond ONLY with valid JSON."
+        raw = gemini_call(retry_prompt, system="You are a senior software architect.")
+        plan = parse_task_plan(raw)
+
+    return plan
+
+
+def _plan_agentic(dna_context: str, state_context: str, gemini_call) -> list[dict]:
+    """Agentic: multi-step plan with 2-5 ordered subtasks."""
+    decide_prompt = f"""You are an autonomous software development agent maintaining a GitHub repository.
+Below is the complete DNA map of the codebase and the agent's memory/state.
+
+Your job: design a multi-step plan for the single most valuable improvement to make today.
+Break it into 2-5 ordered subtasks that build on each other.
+
+Rules:
+- Pick ONE coherent improvement (e.g. "add user auth", "add CLI commands", "improve test coverage")
+- Break it into 2-5 subtasks executed in order — each subtask should produce working code
+- Earlier subtasks should create foundations that later subtasks build on
+- Each subtask specifies which files to READ, CREATE, and MODIFY
+- Prefer improvements that advance the current roadmap phase
+- Keep subtasks small and focused — one concern per subtask
+
+## DNA
+{dna_context}
+
+## Agent State
+```json
+{state_context}
+```
+
+Return ONLY valid JSON (no markdown fences, no extra text):
+{{
+  "goal": "high-level description of the improvement",
+  "rationale": "why this is the most valuable next step",
+  "subtasks": [
+    {{
+      "task": "subtask 1 description",
+      "files_to_read": ["path/to/file.py"],
+      "files_to_create": ["new/file.py"],
+      "files_to_modify": ["existing/file.py"]
+    }},
+    {{
+      "task": "subtask 2 description",
+      "files_to_read": ["new/file.py"],
+      "files_to_create": [],
+      "files_to_modify": ["another/file.py"]
+    }}
+  ]
+}}"""
+
+    raw = gemini_call(decide_prompt, system="You are a senior software architect.")
+    plan = _parse_multi_step_plan(raw)
 
     # Retry once if parse failed
-    if plan.get("rationale", "").startswith("Fallback"):
-        retry_prompt = decide_prompt + "\n\nIMPORTANT: Respond ONLY with valid JSON. No markdown, no explanation."
-        raw_plan = gemini_call(retry_prompt, system="You are a senior software architect.")
-        plan = parse_task_plan(raw_plan)
+    if not plan:
+        retry_prompt = decide_prompt + "\n\nIMPORTANT: Respond ONLY with valid JSON. No markdown."
+        raw = gemini_call(retry_prompt, system="You are a senior software architect.")
+        plan = _parse_multi_step_plan(raw)
 
-    task_desc = plan.get("task", "General improvement")
-    console.print(f"  [cyan]Task:[/cyan] {task_desc}")
+    if not plan:
+        # Final fallback — treat as oneshot
+        console.print("[yellow]Multi-step plan parse failed — falling back to single task.[/yellow]")
+        single = _plan_oneshot(dna_context, state_context, gemini_call)
+        return [single]
 
-    # ── Step 2.5: Create GitHub Issue for this task ──────────────────
-    repo_name = state.get("repo_name", repo_local_path.name)
-    issue_number = None
+    return plan
+
+
+def _parse_multi_step_plan(raw: str) -> list[dict] | None:
+    """Parse a multi-step plan JSON into a list of subtask dicts.
+
+    Returns None if parsing fails entirely.
+    """
+    cleaned = raw.strip()
+    if cleaned.startswith("```"):
+        import re
+        cleaned = re.sub(r"^```[a-zA-Z]*\n?", "", cleaned)
+    if cleaned.endswith("```"):
+        cleaned = cleaned[:-3].strip()
+
     try:
-        issue_number = create_issue(repo_name, task_desc, plan.get("rationale", ""))
-        if issue_number:
-            console.print(f"  [dim]Opened issue #{issue_number}[/dim]")
-    except Exception:
-        pass  # non-critical
+        result = json.loads(cleaned)
+    except json.JSONDecodeError:
+        # Try to extract JSON object
+        import re
+        match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+        if match:
+            try:
+                result = json.loads(match.group())
+            except json.JSONDecodeError:
+                return None
+        else:
+            return None
 
-    # ── Step 3: Read requested files ─────────────────────────────────
-    console.print("[bold]Step 3/7:[/bold] Reading requested files…")
+    if not isinstance(result, dict):
+        return None
 
-    files_to_read = list(plan.get("files_to_read", []))
-    # Also include files_to_modify (agent needs to see current content)
-    for f in plan.get("files_to_modify", []):
+    subtasks = result.get("subtasks", [])
+    if not subtasks or not isinstance(subtasks, list):
+        return None
+
+    # Inject the top-level goal/rationale into each subtask for context
+    goal = result.get("goal", "")
+    rationale = result.get("rationale", "")
+    for st in subtasks:
+        st.setdefault("goal", goal)
+        st.setdefault("rationale", rationale)
+
+    return subtasks
+
+
+# ── Subtask execution ────────────────────────────────────────────────
+
+def _execute_subtask(
+    repo_local_path: Path,
+    subtask: dict,
+    task_desc: str,
+    dna_context: str,
+    cumulative_file_contents: dict[str, str],
+    gemini_call,
+    is_agentic: bool,
+    tracker: dict[str, int],
+) -> tuple[list[str], dict[str, str], dict[str, str]]:
+    """Execute a single subtask: read → generate → validate → [test → review].
+
+    Returns:
+        (written_files, written_contents, file_contents_read)
+    """
+    # ── Read requested files ─────────────────────────────────────────
+    files_to_read = list(subtask.get("files_to_read", []))
+    for f in subtask.get("files_to_modify", []):
         if f not in files_to_read:
             files_to_read.append(f)
 
-    file_contents: dict[str, str] = {}
+    file_contents: dict[str, str] = dict(cumulative_file_contents)  # start with prior context
     for rel_path in files_to_read:
+        if rel_path in file_contents:
+            continue  # already have it from a prior subtask
         full_path = repo_local_path / rel_path
         if not full_path.is_file():
             continue
         try:
             content = full_path.read_text(encoding="utf-8", errors="replace")
-            file_contents[rel_path] = content[:MAX_FILE_CHARS * 3]  # generous limit for targeted reads
+            file_contents[rel_path] = content[:MAX_FILE_CHARS * 3]
             console.print(f"  [dim]Read {rel_path} ({len(content)} chars)[/dim]")
         except OSError:
             continue
 
-    # ── Step 4: Call 2 — Generate implementation + validate ──────────
-    console.print("[bold]Step 4/7:[/bold] Generating implementation (Call 2)…")
-
-    all_target_files = list(plan.get("files_to_create", [])) + list(plan.get("files_to_modify", []))
+    # ── Generate files ───────────────────────────────────────────────
+    all_target_files = list(subtask.get("files_to_create", [])) + list(subtask.get("files_to_modify", []))
     if not all_target_files:
         all_target_files = ["README.md"]
 
     written_files: list[str] = []
-    written_contents: dict[str, str] = {}  # track content for agentic review
+    written_contents: dict[str, str] = {}
+
     for rel_path in all_target_files:
         full_path = repo_local_path / rel_path
         current = file_contents.get(rel_path)
@@ -289,7 +535,6 @@ Return ONLY valid JSON (no markdown fences, no extra text):
             except OSError:
                 pass
 
-        # Build file-specific context from DNA + read files
         file_context = _build_implementation_context(rel_path, task_desc, file_contents, dna_context)
 
         try:
@@ -304,14 +549,13 @@ Return ONLY valid JSON (no markdown fences, no extra text):
             console.print(f"[yellow]Stopping file generation: {exc}[/yellow]")
             break
 
-        # Validate generated content
+        # Validate
         errors = validate_source(rel_path, new_content)
         if errors:
             console.print(f"  [yellow]⚠ Validation errors in {rel_path}:[/yellow]")
             for err in errors:
                 console.print(f"    [dim]{err}[/dim]")
 
-            # Retry once with error feedback
             retry_context = file_context + format_errors_for_retry(rel_path, errors)
             try:
                 new_content = generate_file_content(
@@ -337,21 +581,14 @@ Return ONLY valid JSON (no markdown fences, no extra text):
         console.print(f"  [green]✓[/green] {rel_path}")
 
     if not written_files:
-        console.print("[yellow]No files were written — aborting session.[/yellow]")
-        return {
-            "task": task_desc,
-            "files_changed": [],
-            "commit_message": "",
-            "requests_used": tracker["requests_used"],
-        }
+        return [], {}, file_contents
 
-    # ── Step 4a: [Agentic] Run tests + fix loop ─────────────────────
+    # ── [Agentic] Tests ──────────────────────────────────────────────
     if is_agentic:
-        console.print("[bold]Step 4a/9:[/bold] Running test suite…")
         test_result = run_tests(repo_local_path)
 
         if test_result.tests_found and not test_result.passed:
-            console.print(f"  [yellow]⚠ Tests failed ({test_result.runner}, exit {test_result.exit_code})[/yellow]")
+            console.print(f"  [yellow]⚠ Tests failed ({test_result.runner})[/yellow]")
 
             for attempt in range(1, AGENTIC_MAX_FIX_ATTEMPTS + 1):
                 console.print(f"  [dim]Fix attempt {attempt}/{AGENTIC_MAX_FIX_ATTEMPTS}…[/dim]")
@@ -363,53 +600,42 @@ Return ONLY valid JSON (no markdown fences, no extra text):
                     if not full_path.exists():
                         continue
                     current = full_path.read_text(encoding="utf-8", errors="replace")
-                    file_context = _build_implementation_context(
+                    fix_ctx = _build_implementation_context(
                         rel_path, task_desc, file_contents, dna_context
                     ) + error_context
                     try:
-                        fixed_content = generate_file_content(
-                            task=task_desc,
-                            file_path=rel_path,
-                            current_content=current,
-                            project_context=file_context,
+                        fixed = generate_file_content(
+                            task=task_desc, file_path=rel_path,
+                            current_content=current, project_context=fix_ctx,
                             gemini_call=gemini_call,
                         )
-                        full_path.write_text(fixed_content, encoding="utf-8")
-                        written_contents[rel_path] = fixed_content
+                        full_path.write_text(fixed, encoding="utf-8")
+                        written_contents[rel_path] = fixed
                         any_fixed = True
                     except (BudgetExhaustedError, GeminiCallError):
-                        console.print("  [yellow]Budget exhausted during test fix — stopping.[/yellow]")
+                        console.print("  [yellow]Budget exhausted during test fix.[/yellow]")
                         break
 
                 if not any_fixed:
                     break
 
-                # Re-run tests after fix
                 test_result = run_tests(repo_local_path)
                 if test_result.passed:
-                    console.print(f"  [green]✓ Tests pass after fix attempt {attempt}[/green]")
+                    console.print(f"  [green]✓ Tests pass (attempt {attempt})[/green]")
                     break
-                console.print(f"  [yellow]Tests still failing after attempt {attempt}[/yellow]")
 
             if not test_result.passed:
-                console.print("[red]✗ Tests still failing after all fix attempts — reverting.[/red]")
+                console.print("[red]✗ Tests failing — reverting subtask.[/red]")
                 _revert_changes(repo_local_path, written_files)
-                return {
-                    "task": task_desc,
-                    "files_changed": [],
-                    "commit_message": "",
-                    "requests_used": tracker["requests_used"],
-                    "reverted": True,
-                    "reason": "tests_failed",
-                }
+                return [], {}, file_contents
+
         elif test_result.tests_found:
-            console.print(f"  [green]✓ All tests pass ({test_result.runner})[/green]")
+            console.print(f"  [green]✓ Tests pass ({test_result.runner})[/green]")
         else:
             console.print(f"  [dim]{test_result.output}[/dim]")
 
-    # ── Step 4b: [Agentic] Self-review + fix loop ────────────────────
+    # ── [Agentic] Self-review ────────────────────────────────────────
     if is_agentic:
-        console.print("[bold]Step 4b/9:[/bold] Self-review…")
         try:
             review = self_review(task_desc, written_contents, dna_context, gemini_call)
         except (BudgetExhaustedError, GeminiCallError):
@@ -417,43 +643,37 @@ Return ONLY valid JSON (no markdown fences, no extra text):
 
         if not review["approved"]:
             for attempt in range(1, AGENTIC_MAX_FIX_ATTEMPTS + 1):
-                console.print(f"  [dim]Review fix attempt {attempt}/{AGENTIC_MAX_FIX_ATTEMPTS}…[/dim]")
+                console.print(f"  [dim]Review fix {attempt}/{AGENTIC_MAX_FIX_ATTEMPTS}…[/dim]")
                 review_context = format_review_for_retry(review["issues"])
 
-                # Fix only the files flagged by the reviewer
-                flagged_files = {issue.get("file") for issue in review["issues"] if issue.get("file")}
-                if not flagged_files:
-                    flagged_files = set(written_files)
+                flagged = {i.get("file") for i in review["issues"] if i.get("file")}
+                if not flagged:
+                    flagged = set(written_files)
 
-                for rel_path in flagged_files:
+                for rel_path in flagged:
                     if rel_path not in written_files:
                         continue
                     full_path = repo_local_path / rel_path
                     if not full_path.exists():
                         continue
                     current = full_path.read_text(encoding="utf-8", errors="replace")
-                    file_context = _build_implementation_context(
+                    fix_ctx = _build_implementation_context(
                         rel_path, task_desc, file_contents, dna_context
                     ) + review_context
                     try:
-                        fixed_content = generate_file_content(
-                            task=task_desc,
-                            file_path=rel_path,
-                            current_content=current,
-                            project_context=file_context,
+                        fixed = generate_file_content(
+                            task=task_desc, file_path=rel_path,
+                            current_content=current, project_context=fix_ctx,
                             gemini_call=gemini_call,
                         )
-                        errors = validate_source(rel_path, fixed_content)
-                        if errors:
-                            console.print(f"  [yellow]Review fix introduced syntax errors in {rel_path} — keeping original[/yellow]")
+                        if validate_source(rel_path, fixed):
+                            console.print(f"  [yellow]Review fix broke syntax in {rel_path} — keeping original[/yellow]")
                             continue
-                        full_path.write_text(fixed_content, encoding="utf-8")
-                        written_contents[rel_path] = fixed_content
+                        full_path.write_text(fixed, encoding="utf-8")
+                        written_contents[rel_path] = fixed
                     except (BudgetExhaustedError, GeminiCallError):
-                        console.print("  [yellow]Budget exhausted during review fix — stopping.[/yellow]")
                         break
 
-                # Re-review
                 try:
                     review = self_review(task_desc, written_contents, dna_context, gemini_call)
                 except (BudgetExhaustedError, GeminiCallError):
@@ -461,83 +681,13 @@ Return ONLY valid JSON (no markdown fences, no extra text):
                     break
 
                 if review["approved"]:
-                    console.print(f"  [green]✓ Review passed after fix attempt {attempt}[/green]")
+                    console.print(f"  [green]✓ Review passed (attempt {attempt})[/green]")
                     break
 
-            # If review still not approved after all attempts, log but proceed
-            # (review issues are softer than test failures — don't revert)
             if not review["approved"]:
-                console.print("[yellow]Review issues remain — proceeding anyway.[/yellow]")
+                console.print("[yellow]Review issues remain — proceeding.[/yellow]")
 
-    step_label = "5/9" if is_agentic else "5/7"
-
-    # ── Step 5: Generate commit message ──────────────────────────────
-    console.print(f"[bold]Step {step_label}:[/bold] Generating commit message…")
-
-    try:
-        commit_msg = generate_commit_message(task_desc, written_files, gemini_call)
-    except (BudgetExhaustedError, GeminiCallError):
-        commit_msg = "chore: automated improvement"
-
-    # Append issue reference to close it via commit
-    if issue_number:
-        commit_msg += f" (closes #{issue_number})"
-
-    console.print(f"  [dim]{commit_msg}[/dim]")
-
-    # ── Step 6: Update DNA for changed files ─────────────────────────
-    step6_label = "6/9" if is_agentic else "6/7"
-    console.print(f"[bold]Step {step6_label}:[/bold] Updating DNA for changed files…")
-
-    try:
-        dna = update_dna(repo_local_path, gemini_call)
-        _advance_roadmap_phase(dna, state, gemini_call)
-    except (BudgetExhaustedError, GeminiCallError):
-        console.print("[yellow]DNA post-update skipped (budget).[/yellow]")
-
-    written_files.append(".dna")
-
-    # ── Step 7: Update memory, commit & push ─────────────────────────
-    step7_label = "7/9" if is_agentic else "7/7"
-    console.print(f"[bold]Step {step7_label}:[/bold] Saving state, committing & pushing…")
-
-    state["current_phase"] = task_desc
-    state = append_session_log(state, task_desc, written_files, tracker["requests_used"])
-    save_state(repo_local_path, state)
-    written_files.append(".agent_state.json")
-
-    try:
-        commit_and_push(repo_local_path, written_files, commit_msg)
-        console.print("[green]Pushed successfully.[/green]")
-    except Exception as exc:
-        console.print(f"[red]Git push failed: {exc}[/red]")
-        console.print("[yellow]Changes are committed locally. Re-run or push manually.[/yellow]")
-
-    # Update managed_repos.json
-    update_last_session(repo_name)
-
-    # ── Session summary ──────────────────────────────────────────────
-    summary = {
-        "task": task_desc,
-        "files_changed": written_files,
-        "commit_message": commit_msg,
-        "requests_used": tracker["requests_used"],
-        "session_mode": effective_mode,
-    }
-
-    mode_tag = "[cyan]agentic[/cyan]" if is_agentic else "[dim]oneshot[/dim]"
-    console.print(Panel(
-        f"[bold]Repo:[/bold]     {repo_name}\n"
-        f"[bold]Mode:[/bold]     {effective_mode}\n"
-        f"[bold]Task:[/bold]     {task_desc}\n"
-        f"[bold]Files:[/bold]    {', '.join(written_files)}\n"
-        f"[bold]Commit:[/bold]   {commit_msg}\n"
-        f"[bold]Requests:[/bold] {tracker['requests_used']} used",
-        title="Session Complete",
-        border_style="green",
-    ))
-
-    return summary
+    return written_files, written_contents, file_contents
 
 
 # ── Helpers ──────────────────────────────────────────────────────────
