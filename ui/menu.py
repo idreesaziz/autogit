@@ -187,9 +187,19 @@ def _handle_work_on_repo() -> None:
     if not repo:
         return
 
-    console.print(f"\n[bold]Running session on:[/bold] {repo['name']}")
+    # Let user choose session mode
+    console.print()
+    console.print("[bold]Session mode:[/bold]")
+    console.print("  [bold]1[/bold]  Oneshot — plan → generate → validate → push (fast)")
+    console.print("  [bold]2[/bold]  Agentic — + test → fix → review → fix (thorough)")
+    mode_choice = Prompt.ask("Mode", choices=["1", "2"], default="2")
+    session_mode = "oneshot" if mode_choice == "1" else "agentic"
+
+    console.print(f"\n[bold]Running {session_mode} session on:[/bold] {repo['name']}")
     try:
-        run_session(repo["local_path"], mode="manual")
+        result = run_session(repo["local_path"], mode="manual", session_mode=session_mode)
+        if result.get("reverted"):
+            console.print(f"[yellow]Session reverted: {result.get('reason', 'unknown')}[/yellow]")
     except FileNotFoundError as exc:
         console.print(f"[red]{exc}[/red]")
     except (BudgetExhaustedError, GeminiCallError) as exc:
@@ -200,7 +210,7 @@ def _handle_work_on_repo() -> None:
 
 # ── Option 3: Run all repos automatically ───────────────────────────
 
-def run_all_repos(silent: bool = False, force: bool = False) -> None:
+def run_all_repos(silent: bool = False, force: bool = False, session_mode: str | None = None) -> None:
     """Run a session on every managed repo. Used by menu and deadline watchdog."""
     repos = list_managed_repos()
     if not repos:
@@ -213,7 +223,7 @@ def run_all_repos(silent: bool = False, force: bool = False) -> None:
         if not silent:
             console.print(f"\n[bold cyan]── {repo['name']} ──[/bold cyan]")
         try:
-            summary = run_session(repo["local_path"], mode="auto", force=force)
+            summary = run_session(repo["local_path"], mode="auto", force=force, session_mode=session_mode)
             results.append({"repo": repo["name"], **summary})
         except FileNotFoundError:
             if not silent:
