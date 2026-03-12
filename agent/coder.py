@@ -70,26 +70,43 @@ def generate_commit_message(
     task: str,
     files_changed: list[str],
     gemini_call,
+    prior_messages: list[str] | None = None,
 ) -> str:
     """Ask Gemini for a conventional commit message.
+
+    Args:
+        task: Description of the change.
+        files_changed: List of files touched.
+        gemini_call: Rate-limited Gemini call function.
+        prior_messages: Earlier commit messages from this session (to avoid repetition).
 
     Returns:
         A single-line conventional commit message (e.g. 'feat: add config parser').
     """
+    prior_section = ""
+    if prior_messages:
+        prior_section = (
+            "\nEarlier commits in this session (do NOT repeat these patterns):\n"
+            + "\n".join(f"  - {m}" for m in prior_messages)
+            + "\n"
+        )
+
     prompt = f"""Generate a single-line git commit message for this change.
 
 Task: {task}
 Files changed: {', '.join(files_changed)}
-
+{prior_section}
 Rules:
 - Use conventional commit format: <type>: <short description>
 - Types: feat, fix, docs, refactor, test, chore, style
-- Write like a real developer — vary your wording naturally
-- Sometimes be terse ("fix: handle null case"), sometimes slightly more descriptive
+- Write like a real developer — casual, terse, natural
 - NO emojis, NO unicode symbols, NO special characters — plain ASCII only
 - Lowercase, no period at the end
-- Do NOT start with generic filler like "implement" or "add support for" every time
-- Vary verbs: add, wire up, hook in, set up, drop, rework, clean up, flesh out, etc.
+- Do NOT mechanically mirror the task description — rephrase it
+- Do NOT always use the same verb — mix it up: add, wire up, hook in, set up, drop, rework, flesh out, stub out, plumb, land, swap in, tighten, etc.
+- Do NOT include issue references like (closes #N) or (#N)
+- Vary length: sometimes very short ("fix: null check in parser"), sometimes slightly longer
+- Focus on WHAT changed in the code, not the abstract goal
 
 Return ONLY the commit message line. No quotes, no explanation."""
 

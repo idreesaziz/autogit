@@ -1,4 +1,4 @@
-"""PyGithub wrapper — create repos, track managed repos."""
+"""PyGithub wrapper — create repos, track managed repos, external repo ops."""
 
 import json
 from datetime import date
@@ -131,3 +131,144 @@ def close_issue(repo_name: str, issue_number: int) -> bool:
     except GithubException as exc:
         console.print(f"[yellow]Could not close issue #{issue_number}: {exc}[/yellow]")
         return False
+
+
+# ── External repo operations ────────────────────────────────────────
+
+def fetch_open_issues(
+    full_repo_name: str,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    """Fetch open issues from an external repo, oldest first.
+
+    Args:
+        full_repo_name: "owner/repo" format.
+        limit: Max issues to return.
+
+    Returns:
+        List of dicts with number, title, body, labels, created_at, comments.
+    """
+    gh = get_github_client()
+    repo = gh.get_repo(full_repo_name)
+    issues = repo.get_issues(state="open", sort="created", direction="asc")
+
+    results: list[dict[str, Any]] = []
+    for issue in issues:
+        if issue.pull_request:
+            continue  # skip PRs
+        results.append({
+            "number": issue.number,
+            "title": issue.title,
+            "body": (issue.body or "")[:3000],
+            "labels": [l.name for l in issue.labels],
+            "created_at": issue.created_at.isoformat(),
+            "comments": issue.comments,
+        })
+        if len(results) >= limit:
+            break
+
+    return results
+
+
+def fetch_repo_readme(full_repo_name: str) -> str:
+    """Fetch a repo's README content."""
+    gh = get_github_client()
+    repo = gh.get_repo(full_repo_name)
+    try:
+        readme = repo.get_readme()
+        return readme.decoded_content.decode("utf-8", errors="replace")[:8000]
+    except GithubException:
+        return "(no README found)"
+
+
+def fetch_repo_tree(full_repo_name: str) -> list[dict[str, Any]]:
+    """Fetch the full directory tree via the Git tree API.
+
+    Returns list of dicts with path, type (blob/tree), and size.
+    """
+    gh = get_github_client()
+    repo = gh.get_repo(full_repo_name)
+    try:
+        default_branch = repo.default_branch
+        tree = repo.get_git_tree(default_branch, recursive=True)
+        entries: list[dict[str, Any]] = []
+        for item in tree.tree:
+            entries.append({
+                "path": item.path,
+                "type": item.type,  # "blob" or "tree"
+                "size": item.size or 0,
+            })
+        return entries
+    except GithubException as exc:
+        console.print(f"[yellow]Could not fetch tree: {exc}[/yellow]")
+        return []
+
+
+def fetch_file_content(full_repo_name: str, file_path: str) -> str | None:
+    """Fetch a single file's content from a repo."""
+    gh = get_github_client()
+    repo = gh.get_repo(full_repo_name)
+    try:
+        content = repo.get_contents(file_path)
+        if isinstance(content, list):
+            return None  # it's a directory
+        return content.decoded_content.decode("utf-8", errors="replace")
+    except GithubException:
+        return None
+
+
+def fork_repo(full_repo_name: str) -> str:
+    """Fork a repo under the authenticated user. Returns the fork's full name.
+
+    If already forked, returns the existing fork.
+    """
+    gh = get_github_client()
+    repo = gh.get_repo(full_repo_name)
+    user = gh.get_user()
+
+    # Check if already forked
+    try:
+        existing = gh.get_repo(f"{GITHUB_USERNAME}/{repo.name}")
+        if existing.fork:
+            console.print(f"  [dim]Fork already exists: {existing.full_name}[/dim]")
+            return existing.full_name
+    except GithubException:
+        pass  # not forked yet
+
+    try:
+        fork = user.create_fork(repo)
+        console.print(f"  [green]Forked:[/green] {fork.full_name}")
+        return fork.full_name
+    except GithubException as exc:
+        console.print(f"[red]Fork failed: {exc}[/red]")
+        raise
+
+
+def create_draft_pr(
+    upstream_full_name: str,
+    fork_full_name: str,
+    branch: str,
+    title: str,
+    body: str,
+) -> int | None:
+    """Open a draft PR from fork branch to upstream default branch.
+
+    Returns the PR number or None on failure.
+    """
+    gh = get_github_client()
+    upstream = gh.get_repo(upstream_full_name)
+    fork_owner = fork_full_name.split("/")[0]
+
+    try:
+        pr = upstream.create_pull(
+            title=title,
+            body=body,
+            head=f"{fork_owner}:{branch}",
+            base=upstream.default_branch,
+            draft=True,
+        )
+        console.print(f"  [green]Draft PR #{pr.number}:[/green] {pr.html_url}")
+        return pr.number
+    except GithubException as exc:
+        console.print(f"[red]PR creation failed: {exc}[/red]")
+        return None

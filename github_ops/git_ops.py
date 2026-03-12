@@ -60,26 +60,37 @@ def init_repo(local_path: str | Path, remote_url: str) -> Repo:
     return repo
 
 
-def commit_and_push(
+def commit_files(
     local_path: str | Path,
     files: list[str],
     message: str,
 ) -> None:
-    """Stage specific files, commit, and push to origin main."""
+    """Stage specific files and commit (no push)."""
     repo = Repo(str(local_path))
     _configure_identity(repo)
-
-    # Stage the listed files
     repo.index.add(files)
     repo.index.commit(message)
 
-    # Push — create remote branch on first push
+
+def push_to_remote(local_path: str | Path) -> None:
+    """Push all local commits to origin main."""
+    repo = Repo(str(local_path))
     try:
         repo.remotes.origin.push(refspec="HEAD:refs/heads/main")
     except GitCommandError as exc:
         console.print(f"[red]Push failed: {exc}[/red]")
         console.print("[yellow]Tip: check your GITHUB_TOKEN permissions or resolve conflicts manually.[/yellow]")
         raise
+
+
+def commit_and_push(
+    local_path: str | Path,
+    files: list[str],
+    message: str,
+) -> None:
+    """Stage specific files, commit, and push to origin main."""
+    commit_files(local_path, files, message)
+    push_to_remote(local_path)
 
 
 def get_recent_files(local_path: str | Path, n: int = 10) -> list[str]:

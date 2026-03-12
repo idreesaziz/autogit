@@ -47,7 +47,7 @@ from agent.dna import (
 from agent.validator import validate_source, format_errors_for_retry
 from agent.test_runner import run_tests, format_test_errors_for_retry
 from agent.reviewer import self_review, format_review_for_retry
-from github_ops.git_ops import commit_and_push
+from github_ops.git_ops import commit_and_push, commit_files, push_to_remote
 from github_ops.api import update_last_session, create_issue, close_issue
 
 console = Console()
@@ -214,24 +214,9 @@ def run_session(
         # Wrap single plan as one subtask so the execution path is uniform
         subtasks = [plan]
 
-    # ── Step 2.5: Create GitHub Issue ────────────────────────────────
-    issue_number = None
-    try:
-        rationale = subtasks[0].get("rationale", "")
-        issue_body = rationale
-        if is_agentic and len(subtasks) > 1:
-            issue_body += "\n\n## Subtasks\n"
-            for i, st in enumerate(subtasks, 1):
-                issue_body += f"- [ ] {st.get('task', '?')}\n"
-        issue_number = create_issue(repo_name, task_desc, issue_body)
-        if issue_number:
-            console.print(f"  [dim]Opened issue #{issue_number}[/dim]")
-    except Exception:
-        pass  # non-critical
-
-    # ── Step 3: Execute subtasks ─────────────────────────────────────
+    # ── Step 3: Execute subtasks (atomic commit per subtask) ────────
     all_written_files: list[str] = []
-    all_written_contents: dict[str, str] = {}
+    all_commit_messages: list[str] = []
     cumulative_file_contents: dict[str, str] = {}  # grows across subtasks
 
     for idx, subtask in enumerate(subtasks):
@@ -263,11 +248,25 @@ def run_session(
             continue
 
         all_written_files.extend(written)
-        all_written_contents.update(contents)
         cumulative_file_contents.update(file_ctx)
-        # Also update cumulative with what was just written so next subtask sees it
         for fp, c in contents.items():
             cumulative_file_contents[fp] = c
+
+        # ── Atomic commit for this subtask ───────────────────────────
+        try:
+            commit_msg = generate_commit_message(
+                sub_task_desc, written, gemini_call,
+                prior_messages=all_commit_messages,
+            )
+        except (BudgetExhaustedError, GeminiCallError):
+            commit_msg = f"chore: {sub_task_desc.lower()[:60]}"
+
+        try:
+            commit_files(repo_local_path, written, commit_msg)
+            all_commit_messages.append(commit_msg)
+            console.print(f"  [dim]Committed: {commit_msg}[/dim]")
+        except Exception as exc:
+            console.print(f"  [yellow]Commit failed: {exc}[/yellow]")
 
     if not all_written_files:
         console.print("[yellow]No files were written — aborting session.[/yellow]")
@@ -278,21 +277,8 @@ def run_session(
             "requests_used": tracker["requests_used"],
         }
 
-    # ── Step 4: Generate commit message ──────────────────────────────
-    console.print("[bold]Step 4:[/bold] Generating commit message…")
-
-    try:
-        commit_msg = generate_commit_message(task_desc, all_written_files, gemini_call)
-    except (BudgetExhaustedError, GeminiCallError):
-        commit_msg = "chore: automated improvement"
-
-    if issue_number:
-        commit_msg += f" (closes #{issue_number})"
-
-    console.print(f"  [dim]{commit_msg}[/dim]")
-
-    # ── Step 5: Update DNA ───────────────────────────────────────────
-    console.print("[bold]Step 5:[/bold] Updating DNA for changed files…")
+    # ── Step 4: Update DNA + advance phase ───────────────────────────
+    console.print("[bold]Step 4:[/bold] Updating DNA…")
 
     try:
         dna = update_dna(repo_local_path, gemini_call)
@@ -300,18 +286,23 @@ def run_session(
     except (BudgetExhaustedError, GeminiCallError):
         console.print("[yellow]DNA post-update skipped (budget).[/yellow]")
 
-    all_written_files.append(".dna")
-
-    # ── Step 6: Save state, commit & push ────────────────────────────
-    console.print("[bold]Step 6:[/bold] Saving state, committing & pushing…")
+    # ── Step 5: Save state, commit metadata, push ────────────────────
+    console.print("[bold]Step 5:[/bold] Saving state & pushing…")
 
     state["current_phase"] = task_desc
     state = append_session_log(state, task_desc, all_written_files, tracker["requests_used"])
     save_state(repo_local_path, state)
-    all_written_files.append(".agent_state.json")
+
+    meta_files = [".dna", ".agent_state.json"]
+    try:
+        commit_files(repo_local_path, meta_files, "chore: update project state")
+    except Exception:
+        pass
+
+    all_written_files.extend(meta_files)
 
     try:
-        commit_and_push(repo_local_path, all_written_files, commit_msg)
+        push_to_remote(repo_local_path)
         console.print("[green]Pushed successfully.[/green]")
     except Exception as exc:
         console.print(f"[red]Git push failed: {exc}[/red]")
@@ -321,22 +312,25 @@ def run_session(
 
     # ── Session summary ──────────────────────────────────────────────
     subtask_count = len(subtasks)
+    commit_count = len(all_commit_messages)
     summary = {
         "task": task_desc,
         "files_changed": all_written_files,
-        "commit_message": commit_msg,
+        "commit_messages": all_commit_messages,
+        "commit_count": commit_count,
         "requests_used": tracker["requests_used"],
         "session_mode": effective_mode,
         "subtasks": subtask_count,
     }
 
     subtask_line = f" ({subtask_count} subtasks)" if subtask_count > 1 else ""
+    commits_display = "\n".join(f"            {m}" for m in all_commit_messages)
     console.print(Panel(
         f"[bold]Repo:[/bold]     {repo_name}\n"
         f"[bold]Mode:[/bold]     {effective_mode}{subtask_line}\n"
         f"[bold]Task:[/bold]     {task_desc}\n"
         f"[bold]Files:[/bold]    {', '.join(all_written_files)}\n"
-        f"[bold]Commit:[/bold]   {commit_msg}\n"
+        f"[bold]Commits:[/bold]  {commit_count}\n{commits_display}\n"
         f"[bold]Requests:[/bold] {tracker['requests_used']} used",
         title="Session Complete",
         border_style="green",
@@ -765,56 +759,78 @@ def _advance_roadmap_phase(dna: dict, state: dict, gemini_call, repo_path: Path 
             current_phase = phase
             break
 
-    if not current_phase or current_phase.get("status") == "complete":
+    if not current_phase:
         return
 
-    # Check with Gemini
+    # If already marked complete but current_phase wasn't bumped, fix it
+    if current_phase.get("status") == "complete":
+        for phase in roadmap:
+            if phase.get("phase") == current + 1:
+                phase["status"] = "in-progress"
+                project["current_phase"] = current + 1
+                console.print(f"[bold green]Advancing to Phase {current + 1}: {phase.get('title', '?')}[/bold green]")
+                if repo_path:
+                    from agent.dna import save_dna
+                    save_dna(repo_path, dna)
+                return
+        return
+
+    # Build context about what's been done
+    session_log = state.get("session_log", [])
+    recent_tasks = [entry.get("task", "?") for entry in session_log[-7:]]
+
     phase_check_prompt = (
         f"The project '{project.get('name', '?')}' is on phase {current}: "
         f"'{current_phase.get('title', '?')}'.\n"
         f"Description: {current_phase.get('description', '?')}\n\n"
         f"Recent completed tasks from session log:\n"
     )
-    for entry in state.get("session_log", [])[-5:]:
-        phase_check_prompt += f"  - {entry.get('task', '?')}\n"
+    for t in recent_tasks:
+        phase_check_prompt += f"  - {t}\n"
 
     phase_check_prompt += (
-        f"\nIs phase {current} complete? Reply ONLY with JSON: "
-        f'{{ "complete": true/false, "reason": "..." }}'
+        f"\nBased on the tasks completed so far, is phase {current} substantially complete? "
+        f"Be generous — if most of the phase goals have been addressed, mark it complete.\n"
+        f'Reply ONLY with JSON: {{ "complete": true/false, "reason": "..." }}'
     )
 
     try:
         raw = gemini_call(phase_check_prompt, system="You are a project manager.")
         result = json.loads(_strip_json_fences(raw))
-        if result.get("complete"):
-            current_phase["status"] = "complete"
-            # Try to advance to next phase
-            next_phase = None
-            for phase in roadmap:
-                if phase.get("phase") == current + 1:
-                    next_phase = phase
-                    break
+    except (json.JSONDecodeError, Exception) as exc:
+        console.print(f"[dim]Phase check parse failed: {exc} — skipping.[/dim]")
+        return
 
-            if next_phase:
-                next_phase["status"] = "in-progress"
-                project["current_phase"] = current + 1
-                console.print(
-                    f"[bold green]Phase {current} complete! "
-                    f"Advancing to Phase {current + 1}: {next_phase.get('title', '?')}[/bold green]"
-                )
-            else:
-                # All phases done -- project is mature
-                project["mature"] = True
-                console.print(
-                    f"[bold green]All {len(roadmap)} roadmap phases complete! "
-                    f"Project '{project.get('name', '?')}' marked as mature.[/bold green]"
-                )
+    if not result.get("complete"):
+        console.print(f"[dim]Phase {current} not yet complete: {result.get('reason', '?')}[/dim]")
+        return
 
-            if repo_path:
-                from agent.dna import save_dna
-                save_dna(repo_path, dna)
-    except (json.JSONDecodeError, KeyError, Exception):
-        pass  # non-critical
+    current_phase["status"] = "complete"
+    console.print(f"[bold green]Phase {current} complete: {result.get('reason', '')}[/bold green]")
+
+    # Try to advance to next phase
+    next_phase = None
+    for phase in roadmap:
+        if phase.get("phase") == current + 1:
+            next_phase = phase
+            break
+
+    if next_phase:
+        next_phase["status"] = "in-progress"
+        project["current_phase"] = current + 1
+        console.print(
+            f"[bold green]Advancing to Phase {current + 1}: {next_phase.get('title', '?')}[/bold green]"
+        )
+    else:
+        project["mature"] = True
+        console.print(
+            f"[bold green]All {len(roadmap)} roadmap phases complete! "
+            f"Project '{project.get('name', '?')}' marked as mature.[/bold green]"
+        )
+
+    if repo_path:
+        from agent.dna import save_dna
+        save_dna(repo_path, dna)
 
 
 def _strip_json_fences(text: str) -> str:

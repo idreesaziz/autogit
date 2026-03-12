@@ -13,6 +13,7 @@ from rich.status import Status
 
 from agent.session import run_session, _make_gemini_call, BudgetExhaustedError, GeminiCallError
 from agent.researcher import research_trending_ideas, create_repo_from_idea, generate_ideas_from_hint
+from agent.contributor import contribute_to_repo
 from github_ops.api import list_managed_repos
 from agent.memory import load_state
 from config import LOCAL_REPOS_DIR
@@ -36,6 +37,7 @@ def show_menu() -> None:
                 "[bold]\\[4][/bold]  View session logs\n"
                 "[bold]\\[5][/bold]  View dice rolls & schedule\n"
                 "[bold]\\[6][/bold]  Roll & schedule now\n"
+                "[bold]\\[7][/bold]  Contribute to external repo\n"
                 "[bold]\\[Q][/bold]  Quit",
                 title="[bold cyan]autogit[/bold cyan]",
                 subtitle="Autonomous GitHub Agent",
@@ -44,7 +46,7 @@ def show_menu() -> None:
 
             choice = Prompt.ask(
                 "Choose an option",
-                choices=["1", "2", "3", "4", "5", "6", "q", "Q"],
+                choices=["1", "2", "3", "4", "5", "6", "7", "q", "Q"],
                 default="q",
             )
         except (KeyboardInterrupt, EOFError):
@@ -66,6 +68,8 @@ def show_menu() -> None:
             _handle_view_rolls()
         elif choice == "6":
             _handle_run_dice()
+        elif choice == "7":
+            _handle_contribute()
 
 
 # ── Option 1: Create a new repo ─────────────────────────────────────
@@ -422,3 +426,47 @@ def _handle_run_dice() -> None:
         _run_pending_sessions(live=True, run_now=True)
     else:
         console.print("\n[dim]No sessions to run (all rolls failed).[/dim]")
+
+
+# ── Option 7: Contribute to external repo ───────────────────────────
+
+def _handle_contribute() -> None:
+    """Find an easy issue on an external repo, fix it, and open a draft PR."""
+    console.print()
+    repo_input = Prompt.ask(
+        "Enter target repo ([bold]owner/repo[/bold] format, or [bold]0[/bold] to cancel)"
+    ).strip()
+
+    if not repo_input or repo_input == "0":
+        console.print("[dim]Cancelled.[/dim]")
+        return
+
+    if "/" not in repo_input:
+        console.print("[red]Invalid format — use owner/repo (e.g. pallets/flask)[/red]")
+        return
+
+    tracker: dict[str, int] = {"requests_used": 0}
+
+    def gemini_call(prompt: str, system: str = "") -> str:
+        return _make_gemini_call(prompt, system, tracker)
+
+    console.print(f"\n[bold cyan]Targeting: {repo_input}[/bold cyan]\n")
+
+    try:
+        result = contribute_to_repo(repo_input, gemini_call)
+    except (BudgetExhaustedError, GeminiCallError) as exc:
+        console.print(f"[yellow]Stopped: {exc}[/yellow]")
+        return
+    except Exception as exc:
+        console.print(f"[red]Error: {exc}[/red]")
+        return
+
+    status = result.get("status", "unknown")
+    if status == "no_issues":
+        console.print("[dim]No open issues to work on.[/dim]")
+    elif status == "low_confidence":
+        best = result.get("best_issue", {})
+        console.print(
+            f"[dim]Best candidate was #{best.get('number', '?')}: {best.get('title', '?')} "
+            f"(confidence: {best.get('confidence', 0):.0%})[/dim]"
+        )
